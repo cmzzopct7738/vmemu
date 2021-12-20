@@ -2,6 +2,8 @@
 #include <fstream>
 #include <iostream>
 #include <thread>
+#include <vmlocate.hpp>
+
 #include "vmemu_t.hpp"
 
 #define NUM_THREADS 20
@@ -116,17 +118,16 @@ int __cdecl main(int argc, const char* argv[]) {
         std::strtoull(parser.get<std::string>("vmentry").c_str(), nullptr, 16);
 
     std::vector<vm::instrs::code_block_t> code_blocks;
-    vm::ctx_t vmctx(module_base, image_base, image_size, vm_entry_rva);
+    vm::ctx_t vmctx{module_base, image_base, image_size, vm_entry_rva};
 
-    if (!vmctx.init()) {
-      std::printf(
-          "[!] failed to init vmctx... this can be for many reasons..."
-          " try validating your vm entry rva... make sure the binary is "
-          "unpacked and is"
-          "protected with VMProtect 2...\n");
-      return -1;
-    }
-    
-    vm::util::print(vmctx.vm_entry);
+    // testing flatten and deobfuscate on vmp3 vm enters...
+    zydis_routine_t vm_entry;
+    vm::util::flatten(vm_entry, module_base + vm_entry_rva);
+    vm::util::deobfuscate(vm_entry);
+    vm::util::print(vm_entry);
+
+    // testing vmlocate port for vmp3...
+    const auto vm_entries = vm::locate::get_vm_entries(module_base, image_size);
+    std::printf("> number of vm entries = %d\n", vm_entries.size());
   }
 }
