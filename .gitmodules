@@ -1,0 +1,3 @@
+[submodule "deps/vmprofiler"]
+	path = deps/vmprofiler
+	url = https://githacks.org/vmp3/vmprofiler.git
