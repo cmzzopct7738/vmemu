@@ -41,6 +41,7 @@ set(vmemu_SOURCES "")
 
 list(APPEND vmemu_SOURCES
 	"src/main.cpp"
+	"include/vmemu_t.hpp"
 )
 
 list(APPEND vmemu_SOURCES
