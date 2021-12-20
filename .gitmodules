@@ -1,3 +1,6 @@
 [submodule "deps/vmprofiler"]
 	path = deps/vmprofiler
 	url = https://githacks.org/vmp3/vmprofiler.git
+[submodule "deps/unicorn"]
+	path = deps/unicorn
+	url = https://github.com/unicorn-engine/unicorn.git
