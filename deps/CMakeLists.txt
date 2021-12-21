@@ -26,21 +26,3 @@ endif()
 add_subdirectory(unicorn)
 set(CMAKE_FOLDER ${CMKR_CMAKE_FOLDER})
 
-# Target cli-parser
-set(CMKR_TARGET cli-parser)
-set(cli-parser_SOURCES "")
-
-set(CMKR_SOURCES ${cli-parser_SOURCES})
-add_library(cli-parser INTERFACE)
-
-if(cli-parser_SOURCES)
-	target_sources(cli-parser INTERFACE ${cli-parser_SOURCES})
-endif()
-
-target_include_directories(cli-parser INTERFACE
-	cli-parser
-)
-
-unset(CMKR_TARGET)
-unset(CMKR_SOURCES)
-

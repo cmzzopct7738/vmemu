@@ -46,11 +46,11 @@ int __cdecl main(int argc, const char* argv[]) {
     return 0;
   }
 
-  vm::util::init();
-
+  vm::utils::init();
   std::vector<std::uint8_t> module_data, tmp, unpacked_bin;
-  if (!vm::util::open_binary_file(parser.get<std::string>("bin"),
-                                  module_data)) {
+
+  if (!vm::utils::open_binary_file(parser.get<std::string>("bin"),
+                                   module_data)) {
     std::printf("[!] failed to open binary file...\n");
     return -1;
   }
@@ -117,17 +117,22 @@ int __cdecl main(int argc, const char* argv[]) {
     const auto vm_entry_rva =
         std::strtoull(parser.get<std::string>("vmentry").c_str(), nullptr, 16);
 
-    std::vector<vm::instrs::code_block_t> code_blocks;
-    vm::ctx_t vmctx(module_base, image_base, image_size, vm_entry_rva);
+    vm::vmctx_t vmctx(module_base, image_base, image_size, vm_entry_rva);
+    if (!vmctx.init()) {
+      std::printf(
+          "[!] failed to init vmctx... this can be for many reasons..."
+          " try validating your vm entry rva... make sure the binary is "
+          "unpacked and is"
+          "protected with VMProtect 3...\n");
+      return -1;
+    }
 
-    // testing flatten and deobfuscate on vmp3 vm enters...
-    zydis_routine_t vm_entry;
-    vm::util::flatten(vm_entry, module_base + vm_entry_rva);
-    vm::util::deobfuscate(vm_entry);
-    vm::util::print(vm_entry);
-
-    // testing vmlocate port for vmp3...
-    const auto vm_entries = vm::locate::get_vm_entries(module_base, image_size);
-    std::printf("> number of vm entries = %d\n", vm_entries.size());
+    vm::emu_t emu(&vmctx);
+    if (!emu.init()) {
+      std::printf(
+          "[!] failed to init vm::emu_t... read above in the console for the "
+          "reason...\n");
+      return -1;
+    }
   }
 }

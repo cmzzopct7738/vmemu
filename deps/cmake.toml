@@ -1,6 +1,2 @@
 [subdir.vmprofiler]
 [subdir.unicorn]
-
-[target.cli-parser]
-type = "interface"
-include-directories = ["cli-parser"]
