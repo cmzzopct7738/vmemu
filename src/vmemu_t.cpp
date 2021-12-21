@@ -1,7 +1,8 @@
 #include <vmemu_t.hpp>
 
 namespace vm {
-emu_t::emu_t(vm::vmctx_t* vm_ctx) : m_vm_ctx(vm_ctx) {}
+emu_t::emu_t(vm::vmctx_t* vm_ctx)
+    : m_vm_ctx(vm_ctx), vip(vm_ctx->get_vip()), vsp(vm_ctx->get_vsp()) {}
 
 emu_t::~emu_t() {
   if (uc_ctx)
@@ -58,6 +59,28 @@ bool emu_t::init() {
   return true;
 }
 
+void emu_t::emulate() {
+  uc_err err;
+  std::uintptr_t rip = m_vm_ctx->m_vm_entry_rva + m_vm_ctx->m_module_base,
+                 rsp = STACK_BASE + STACK_SIZE - PAGE_4KB;
+
+  if ((err = uc_reg_write(uc_ctx, UC_X86_REG_RSP, &rsp))) {
+    std::printf("> uc_reg_write error, reason = %d\n", err);
+    return;
+  }
+
+  if ((err = uc_reg_write(uc_ctx, UC_X86_REG_RIP, &rip))) {
+    std::printf("> uc_reg_write error, reason = %d\n", err);
+    return;
+  }
+
+  std::printf("> beginning execution at = %p\n", rip);
+  if ((err = uc_emu_start(uc_ctx, rip, 0ull, 0ull, 0ull))) {
+    std::printf("> error starting emu... reason = %d\n", err);
+    return;
+  }
+}
+
 void emu_t::int_callback(uc_engine* uc, std::uint32_t intno, emu_t* obj) {
   uc_err err;
   std::uintptr_t rip = 0ull;
@@ -93,6 +116,54 @@ bool emu_t::code_exec_callback(uc_engine* uc,
                                uint64_t address,
                                uint32_t size,
                                emu_t* obj) {
+  uc_err err;
+  static thread_local zydis_decoded_instr_t instr;
+  static thread_local zydis_rtn_t instr_stream;
+
+  if (!ZYAN_SUCCESS(ZydisDecoderDecodeBuffer(vm::utils::g_decoder.get(),
+                                             reinterpret_cast<void*>(address),
+                                             PAGE_4KB, &instr))) {
+    std::printf("> failed to decode instruction at = 0x%p\n", address);
+    if ((err = uc_emu_stop(uc))) {
+      std::printf("> failed to stop emulation, exiting... reason = %d\n", err);
+      exit(0);
+    }
+    return false;
+  }
+
+  if (instr.mnemonic == ZYDIS_MNEMONIC_INVALID)
+    return false;
+
+  instr_stream.push_back({instr});
+  if (instr.mnemonic == ZYDIS_MNEMONIC_RET ||
+      (instr.mnemonic == ZYDIS_MNEMONIC_JMP &&
+       instr.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER)) {
+    // find the last mov reg, [vip]
+    auto fetch_offset = std::find_if(
+        instr_stream.rbegin(), instr_stream.rend(),
+        [&](const zydis_instr_t& instr) -> bool {
+          return instr.instr.mnemonic == ZYDIS_MNEMONIC_MOV &&
+                 instr.instr.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                 instr.instr.operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                 instr.instr.operands[1].mem.base == obj->m_vm_ctx->get_vip();
+        });
+
+    // cut off the extra stuff...
+    if (fetch_offset != instr_stream.rend())
+      instr_stream.erase((fetch_offset + 1).base(), instr_stream.end());
+
+    vm::utils::deobfuscate(instr_stream);
+    vm::utils::print(instr_stream);
+
+    auto vinstr = vm::instrs::determine(obj->vip, obj->vsp, instr_stream);
+    if (vinstr.mnemonic == vm::instrs::mnemonic_t::jmp) {
+      std::printf("> found jmp...\n");
+      std::getchar();
+    }
+
+    instr_stream.clear();
+    std::printf("============\n");
+  }
   return true;
 }
 

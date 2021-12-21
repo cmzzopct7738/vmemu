@@ -16,10 +16,12 @@ class emu_t {
   ~emu_t();
 
   bool init();
+  void emulate();
 
  private:
   uc_engine* uc_ctx;
   const vm::vmctx_t* m_vm_ctx;
+  zydis_reg_t vip, vsp;
   uc_hook code_exec_hook, invalid_mem_hook, int_hook;
 
   static void int_callback(uc_engine* uc, std::uint32_t intno, emu_t* obj);

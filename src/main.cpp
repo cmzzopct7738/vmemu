@@ -134,5 +134,6 @@ int __cdecl main(int argc, const char* argv[]) {
           "reason...\n");
       return -1;
     }
+    emu.emulate();
   }
 }
