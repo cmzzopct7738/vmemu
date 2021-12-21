@@ -118,7 +118,7 @@ int __cdecl main(int argc, const char* argv[]) {
         std::strtoull(parser.get<std::string>("vmentry").c_str(), nullptr, 16);
 
     std::vector<vm::instrs::code_block_t> code_blocks;
-    vm::ctx_t vmctx{module_base, image_base, image_size, vm_entry_rva};
+    vm::ctx_t vmctx(module_base, image_base, image_size, vm_entry_rva);
 
     // testing flatten and deobfuscate on vmp3 vm enters...
     zydis_routine_t vm_entry;
