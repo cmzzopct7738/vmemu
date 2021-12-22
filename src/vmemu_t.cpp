@@ -1,13 +1,8 @@
 #include <vmemu_t.hpp>
 
 namespace vm {
-emu_t::emu_t(vm::vmctx_t* vm_ctx,
-             std::map<std::uint32_t, vm::instrs::profiler_t*>* known_hndlrs)
-    : m_vm(vm_ctx),
-      vip(vm_ctx->get_vip()),
-      vsp(vm_ctx->get_vsp()),
-      cc_trace(nullptr),
-      m_known_hndlrs(known_hndlrs) {}
+emu_t::emu_t(vm::vmctx_t* vm_ctx)
+    : m_vm(vm_ctx), vip(vm_ctx->get_vip()), vsp(vm_ctx->get_vsp()) {}
 
 emu_t::~emu_t() {
   if (uc)
@@ -79,9 +74,9 @@ void emu_t::emulate() {
     return;
   }
 
-  cc_trace = std::make_unique<vm::instrs::hndlr_trace_t>();
-  cc_trace->m_vip = vip;
-  cc_trace->m_vsp = vsp;
+  cc_trace.m_uc = uc;
+  cc_trace.m_vip = vip;
+  cc_trace.m_vsp = vsp;
 
   std::printf("> beginning execution at = %p\n", rip);
   if ((err = uc_emu_start(uc, rip, 0ull, 0ull, 0ull))) {
@@ -146,8 +141,10 @@ bool emu_t::code_exec_callback(uc_engine* uc,
   // profiles to grab decrypted values and such...
   uc_context* cpu_ctx;
   uc_context_alloc(obj->uc, &cpu_ctx);
+  uc_context_save(obj->uc, cpu_ctx);
+
   vm::instrs::emu_instr_t emu_instr{instr, cpu_ctx};
-  obj->cc_trace->m_instrs.push_back(emu_instr);
+  obj->cc_trace.m_instrs.push_back(emu_instr);
 
   // RET or JMP REG means the end of a vm handler...
   if (instr.mnemonic == ZYDIS_MNEMONIC_RET ||
@@ -155,12 +152,12 @@ bool emu_t::code_exec_callback(uc_engine* uc,
        instr.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER)) {
     // deobfuscate the instruction stream before profiling...
     // makes it easier for profiles to be correct...
-    vm::instrs::deobfuscate(*obj->cc_trace);
+    vm::instrs::deobfuscate(obj->cc_trace);
 
     // find the last MOV REG, DWORD PTR [VIP] in the instruction stream, then
     // remove any instructions from this instruction to the JMP/RET...
     const auto rva_fetch = std::find_if(
-        obj->cc_trace->m_instrs.rbegin(), obj->cc_trace->m_instrs.rend(),
+        obj->cc_trace.m_instrs.rbegin(), obj->cc_trace.m_instrs.rend(),
         [&vip = obj->vip](const vm::instrs::emu_instr_t& instr) -> bool {
           const auto& i = instr.m_instr;
           return i.mnemonic == ZYDIS_MNEMONIC_MOV &&
@@ -169,17 +166,17 @@ bool emu_t::code_exec_callback(uc_engine* uc,
                  i.operands[1].mem.base == vip && i.operands[1].size == 32;
         });
 
-    if (rva_fetch != obj->cc_trace->m_instrs.rend())
-      obj->cc_trace->m_instrs.erase((rva_fetch + 1).base(),
-                                    obj->cc_trace->m_instrs.end());
+    if (rva_fetch != obj->cc_trace.m_instrs.rend())
+      obj->cc_trace.m_instrs.erase((rva_fetch + 1).base(),
+                                   obj->cc_trace.m_instrs.end());
 
     const auto vinstr =
-        vm::instrs::determine(obj->vip, obj->vsp, *obj->cc_trace);
+        vm::instrs::determine(obj->vip, obj->vsp, obj->cc_trace);
 
     if (vinstr.mnemonic == vm::instrs::mnemonic_t::unknown) {
       zydis_rtn_t inst_stream;
-      std::for_each(obj->cc_trace->m_instrs.begin(),
-                    obj->cc_trace->m_instrs.end(),
+      std::for_each(obj->cc_trace.m_instrs.begin(),
+                    obj->cc_trace.m_instrs.end(),
                     [&](vm::instrs::emu_instr_t& instr) {
                       inst_stream.push_back({instr.m_instr});
                     });
@@ -188,23 +185,27 @@ bool emu_t::code_exec_callback(uc_engine* uc,
       std::printf("========\n");
       std::getchar();
     } else {
-      std::printf("> %s\n",
-                  vm::instrs::get_profile(vinstr.mnemonic)->name.c_str());
+      if (vinstr.imm.has_imm)
+        std::printf("> %s %p\n",
+                    vm::instrs::get_profile(vinstr.mnemonic)->name.c_str(),
+                    vinstr.imm.val);
+      else
+        std::printf("> %s\n",
+                    vm::instrs::get_profile(vinstr.mnemonic)->name.c_str());
     }
 
     if (vinstr.mnemonic == vm::instrs::mnemonic_t::jmp) {
-      obj->cc_trace->m_vip = obj->vip;
-      obj->cc_trace->m_vsp = obj->vsp;
+      obj->cc_trace.m_vip = obj->vip;
+      obj->cc_trace.m_vsp = obj->vsp;
     }
 
     // free the trace since we will start a new one...
-    std::for_each(obj->cc_trace->m_instrs.begin(),
-                  obj->cc_trace->m_instrs.end(),
+    std::for_each(obj->cc_trace.m_instrs.begin(), obj->cc_trace.m_instrs.end(),
                   [&](const vm::instrs::emu_instr_t& instr) {
                     uc_context_free(instr.m_cpu);
                   });
 
-    obj->cc_trace->m_instrs.clear();
+    obj->cc_trace.m_instrs.clear();
   }
   return true;
 }
