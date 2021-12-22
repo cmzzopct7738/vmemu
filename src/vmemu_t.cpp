@@ -173,18 +173,15 @@ bool emu_t::code_exec_callback(uc_engine* uc,
     const auto vinstr =
         vm::instrs::determine(obj->vip, obj->vsp, obj->cc_trace);
 
-    if (vinstr.mnemonic == vm::instrs::mnemonic_t::unknown) {
-      zydis_rtn_t inst_stream;
-      std::for_each(obj->cc_trace.m_instrs.begin(),
-                    obj->cc_trace.m_instrs.end(),
-                    [&](vm::instrs::emu_instr_t& instr) {
-                      inst_stream.push_back({instr.m_instr});
-                    });
+    zydis_rtn_t inst_stream;
+    std::for_each(obj->cc_trace.m_instrs.begin(), obj->cc_trace.m_instrs.end(),
+                  [&](vm::instrs::emu_instr_t& instr) {
+                    inst_stream.push_back({instr.m_instr});
+                  });
 
-      vm::utils::print(inst_stream);
-      std::printf("========\n");
-      std::getchar();
-    } else {
+    vm::utils::print(inst_stream);
+
+    if (vinstr.mnemonic != vm::instrs::mnemonic_t::unknown) {
       if (vinstr.imm.has_imm)
         std::printf("> %s %p\n",
                     vm::instrs::get_profile(vinstr.mnemonic)->name.c_str(),
