@@ -141,21 +141,55 @@ bool emu_t::code_exec_callback(uc_engine* uc,
   if (instr.mnemonic == ZYDIS_MNEMONIC_INVALID)
     return false;
 
+  // save the current cpu's context (all register values and such)...
+  // create a new emu_instr_t with this information... this info will be used by
+  // profiles to grab decrypted values and such...
   uc_context* cpu_ctx;
   uc_context_alloc(obj->uc, &cpu_ctx);
   vm::instrs::emu_instr_t emu_instr{instr, cpu_ctx};
   obj->cc_trace->m_instrs.push_back(emu_instr);
 
+  // RET or JMP REG means the end of a vm handler...
   if (instr.mnemonic == ZYDIS_MNEMONIC_RET ||
       (instr.mnemonic == ZYDIS_MNEMONIC_JMP &&
        instr.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER)) {
+    // deobfuscate the instruction stream before profiling...
+    // makes it easier for profiles to be correct...
+    vm::instrs::deobfuscate(*obj->cc_trace);
+
+    // find the last MOV REG, DWORD PTR [VIP] in the instruction stream, then
+    // remove any instructions from this instruction to the JMP/RET...
+    const auto rva_fetch = std::find_if(
+        obj->cc_trace->m_instrs.rbegin(), obj->cc_trace->m_instrs.rend(),
+        [&vip = obj->vip](const vm::instrs::emu_instr_t& instr) -> bool {
+          const auto& i = instr.m_instr;
+          return i.mnemonic == ZYDIS_MNEMONIC_MOV &&
+                 i.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                 i.operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                 i.operands[1].mem.base == vip && i.operands[1].size == 32;
+        });
+
+    if (rva_fetch != obj->cc_trace->m_instrs.rend())
+      obj->cc_trace->m_instrs.erase((rva_fetch + 1).base(),
+                                    obj->cc_trace->m_instrs.end());
+
     const auto vinstr =
         vm::instrs::determine(obj->vip, obj->vsp, *obj->cc_trace);
 
-    if (vinstr.mnemonic != vm::instrs::mnemonic_t::unknown) {
+    if (vinstr.mnemonic == vm::instrs::mnemonic_t::unknown) {
+      zydis_rtn_t inst_stream;
+      std::for_each(obj->cc_trace->m_instrs.begin(),
+                    obj->cc_trace->m_instrs.end(),
+                    [&](vm::instrs::emu_instr_t& instr) {
+                      inst_stream.push_back({instr.m_instr});
+                    });
+
+      vm::utils::print(inst_stream);
+      std::printf("========\n");
+      std::getchar();
+    } else {
       std::printf("> %s\n",
                   vm::instrs::get_profile(vinstr.mnemonic)->name.c_str());
-      std::getchar();
     }
 
     if (vinstr.mnemonic == vm::instrs::mnemonic_t::jmp) {
