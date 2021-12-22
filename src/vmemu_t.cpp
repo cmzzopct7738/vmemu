@@ -1,55 +1,60 @@
 #include <vmemu_t.hpp>
 
 namespace vm {
-emu_t::emu_t(vm::vmctx_t* vm_ctx)
-    : m_vm_ctx(vm_ctx), vip(vm_ctx->get_vip()), vsp(vm_ctx->get_vsp()) {}
+emu_t::emu_t(vm::vmctx_t* vm_ctx,
+             std::map<std::uint32_t, vm::instrs::profiler_t*>* known_hndlrs)
+    : m_vm(vm_ctx),
+      vip(vm_ctx->get_vip()),
+      vsp(vm_ctx->get_vsp()),
+      cc_trace(nullptr),
+      m_known_hndlrs(known_hndlrs) {}
 
 emu_t::~emu_t() {
-  if (uc_ctx)
-    uc_close(uc_ctx);
+  if (uc)
+    uc_close(uc);
 }
 
 bool emu_t::init() {
   uc_err err;
-  if ((err = uc_open(UC_ARCH_X86, UC_MODE_64, &uc_ctx))) {
+  if ((err = uc_open(UC_ARCH_X86, UC_MODE_64, &uc))) {
     std::printf("> uc_open err = %d\n", err);
     return false;
   }
 
-  if ((err = uc_mem_map(uc_ctx, STACK_BASE, STACK_SIZE, UC_PROT_ALL))) {
+  if ((err = uc_mem_map(uc, STACK_BASE, STACK_SIZE, UC_PROT_ALL))) {
     std::printf("> uc_mem_map stack err, reason = %d\n", err);
     return false;
   }
 
-  if ((err = uc_mem_map(uc_ctx, m_vm_ctx->m_module_base, m_vm_ctx->m_image_size,
+  if ((err = uc_mem_map(uc, m_vm->m_module_base, m_vm->m_image_size,
                         UC_PROT_ALL))) {
     std::printf("> map memory failed, reason = %d\n", err);
     return false;
   }
 
-  if ((err = uc_mem_write(uc_ctx, m_vm_ctx->m_module_base,
-                          reinterpret_cast<void*>(m_vm_ctx->m_module_base),
-                          m_vm_ctx->m_image_size))) {
+  if ((err = uc_mem_write(uc, m_vm->m_module_base,
+                          reinterpret_cast<void*>(m_vm->m_module_base),
+                          m_vm->m_image_size))) {
     std::printf("> failed to write memory... reason = %d\n", err);
     return false;
   }
 
-  if ((err = uc_hook_add(uc_ctx, &code_exec_hook, UC_HOOK_CODE,
+  if ((err = uc_hook_add(uc, &code_exec_hook, UC_HOOK_CODE,
                          (void*)&vm::emu_t::code_exec_callback, this,
-                         m_vm_ctx->m_module_base,
-                         m_vm_ctx->m_module_base + m_vm_ctx->m_image_size))) {
+                         m_vm->m_module_base,
+                         m_vm->m_module_base + m_vm->m_image_size))) {
     std::printf("> uc_hook_add error, reason = %d\n", err);
     return false;
   }
 
-  if ((err = uc_hook_add(uc_ctx, &int_hook, UC_HOOK_INTR,
+  if ((err = uc_hook_add(uc, &int_hook, UC_HOOK_INTR,
                          (void*)&vm::emu_t::int_callback, this, 0ull, 0ull))) {
     std::printf("> uc_hook_add error, reason = %d\n", err);
     return false;
   }
 
   if ((err =
-           uc_hook_add(uc_ctx, &invalid_mem_hook,
+           uc_hook_add(uc, &invalid_mem_hook,
                        UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED |
                            UC_HOOK_MEM_FETCH_UNMAPPED,
                        (void*)&vm::emu_t::invalid_mem, this, true, false))) {
@@ -61,21 +66,25 @@ bool emu_t::init() {
 
 void emu_t::emulate() {
   uc_err err;
-  std::uintptr_t rip = m_vm_ctx->m_vm_entry_rva + m_vm_ctx->m_module_base,
+  std::uintptr_t rip = m_vm->m_vm_entry_rva + m_vm->m_module_base,
                  rsp = STACK_BASE + STACK_SIZE - PAGE_4KB;
 
-  if ((err = uc_reg_write(uc_ctx, UC_X86_REG_RSP, &rsp))) {
+  if ((err = uc_reg_write(uc, UC_X86_REG_RSP, &rsp))) {
     std::printf("> uc_reg_write error, reason = %d\n", err);
     return;
   }
 
-  if ((err = uc_reg_write(uc_ctx, UC_X86_REG_RIP, &rip))) {
+  if ((err = uc_reg_write(uc, UC_X86_REG_RIP, &rip))) {
     std::printf("> uc_reg_write error, reason = %d\n", err);
     return;
   }
+
+  cc_trace = std::make_unique<vm::instrs::hndlr_trace_t>();
+  cc_trace->m_vip = vip;
+  cc_trace->m_vsp = vsp;
 
   std::printf("> beginning execution at = %p\n", rip);
-  if ((err = uc_emu_start(uc_ctx, rip, 0ull, 0ull, 0ull))) {
+  if ((err = uc_emu_start(uc, rip, 0ull, 0ull, 0ull))) {
     std::printf("> error starting emu... reason = %d\n", err);
     return;
   }
@@ -118,8 +127,6 @@ bool emu_t::code_exec_callback(uc_engine* uc,
                                emu_t* obj) {
   uc_err err;
   static thread_local zydis_decoded_instr_t instr;
-  static thread_local zydis_rtn_t instr_stream;
-
   if (!ZYAN_SUCCESS(ZydisDecoderDecodeBuffer(vm::utils::g_decoder.get(),
                                              reinterpret_cast<void*>(address),
                                              PAGE_4KB, &instr))) {
@@ -134,35 +141,36 @@ bool emu_t::code_exec_callback(uc_engine* uc,
   if (instr.mnemonic == ZYDIS_MNEMONIC_INVALID)
     return false;
 
-  instr_stream.push_back({instr});
+  uc_context* cpu_ctx;
+  uc_context_alloc(obj->uc, &cpu_ctx);
+  vm::instrs::emu_instr_t emu_instr{instr, cpu_ctx};
+  obj->cc_trace->m_instrs.push_back(emu_instr);
+
   if (instr.mnemonic == ZYDIS_MNEMONIC_RET ||
       (instr.mnemonic == ZYDIS_MNEMONIC_JMP &&
        instr.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER)) {
-    // find the last mov reg, [vip]
-    auto fetch_offset = std::find_if(
-        instr_stream.rbegin(), instr_stream.rend(),
-        [&](const zydis_instr_t& instr) -> bool {
-          return instr.instr.mnemonic == ZYDIS_MNEMONIC_MOV &&
-                 instr.instr.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                 instr.instr.operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
-                 instr.instr.operands[1].mem.base == obj->m_vm_ctx->get_vip();
-        });
+    const auto vinstr =
+        vm::instrs::determine(obj->vip, obj->vsp, *obj->cc_trace);
 
-    // cut off the extra stuff...
-    if (fetch_offset != instr_stream.rend())
-      instr_stream.erase((fetch_offset + 1).base(), instr_stream.end());
-
-    vm::utils::deobfuscate(instr_stream);
-    vm::utils::print(instr_stream);
-
-    auto vinstr = vm::instrs::determine(obj->vip, obj->vsp, instr_stream);
-    if (vinstr.mnemonic == vm::instrs::mnemonic_t::jmp) {
-      std::printf("> found jmp...\n");
+    if (vinstr.mnemonic != vm::instrs::mnemonic_t::unknown) {
+      std::printf("> %s\n",
+                  vm::instrs::get_profile(vinstr.mnemonic)->name.c_str());
       std::getchar();
     }
 
-    instr_stream.clear();
-    std::printf("============\n");
+    if (vinstr.mnemonic == vm::instrs::mnemonic_t::jmp) {
+      obj->cc_trace->m_vip = obj->vip;
+      obj->cc_trace->m_vsp = obj->vsp;
+    }
+
+    // free the trace since we will start a new one...
+    std::for_each(obj->cc_trace->m_instrs.begin(),
+                  obj->cc_trace->m_instrs.end(),
+                  [&](const vm::instrs::emu_instr_t& instr) {
+                    uc_context_free(instr.m_cpu);
+                  });
+
+    obj->cc_trace->m_instrs.clear();
   }
   return true;
 }

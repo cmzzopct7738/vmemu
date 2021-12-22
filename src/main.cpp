@@ -46,9 +46,7 @@ int __cdecl main(int argc, const char* argv[]) {
     return 0;
   }
 
-  vm::utils::init();
   std::vector<std::uint8_t> module_data, tmp, unpacked_bin;
-
   if (!vm::utils::open_binary_file(parser.get<std::string>("bin"),
                                    module_data)) {
     std::printf("[!] failed to open binary file...\n");
@@ -127,7 +125,9 @@ int __cdecl main(int argc, const char* argv[]) {
       return -1;
     }
 
-    vm::emu_t emu(&vmctx);
+    std::map<std::uint32_t, vm::instrs::profiler_t*> known_hndlrs;
+    vm::emu_t emu(&vmctx, &known_hndlrs);
+
     if (!emu.init()) {
       std::printf(
           "[!] failed to init vm::emu_t... read above in the console for the "

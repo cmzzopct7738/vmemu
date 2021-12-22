@@ -16,13 +16,3 @@ endif()
 add_subdirectory(vmprofiler)
 set(CMAKE_FOLDER ${CMKR_CMAKE_FOLDER})
 
-# unicorn
-set(CMKR_CMAKE_FOLDER ${CMAKE_FOLDER})
-if(CMAKE_FOLDER)
-	set(CMAKE_FOLDER "${CMAKE_FOLDER}/unicorn")
-else()
-	set(CMAKE_FOLDER unicorn)
-endif()
-add_subdirectory(unicorn)
-set(CMAKE_FOLDER ${CMKR_CMAKE_FOLDER})
-

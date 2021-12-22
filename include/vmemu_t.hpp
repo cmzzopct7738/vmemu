@@ -12,16 +12,20 @@
 namespace vm {
 class emu_t {
  public:
-  explicit emu_t(vm::vmctx_t* vm_ctx);
-  ~emu_t();
+  explicit emu_t(
+      vm::vmctx_t* vm_ctx,
+      std::map<std::uint32_t, vm::instrs::profiler_t*>* known_hndlrs);
 
+  ~emu_t();
   bool init();
   void emulate();
 
  private:
-  uc_engine* uc_ctx;
-  const vm::vmctx_t* m_vm_ctx;
+  uc_engine* uc;
+  const vm::vmctx_t* m_vm;
   zydis_reg_t vip, vsp;
+  std::map<std::uint32_t, vm::instrs::profiler_t*>* m_known_hndlrs;
+  std::unique_ptr<vm::instrs::hndlr_trace_t> cc_trace;
   uc_hook code_exec_hook, invalid_mem_hook, int_hook;
 
   static void int_callback(uc_engine* uc, std::uint32_t intno, emu_t* obj);

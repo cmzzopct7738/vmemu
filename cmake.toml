@@ -1,5 +1,4 @@
- 
-[project]
+ [project]
 name = "vmemu"
 
 [subdir.deps]
