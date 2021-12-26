@@ -179,8 +179,6 @@ bool emu_t::code_exec_callback(uc_engine* uc,
                     inst_stream.push_back({instr.m_instr});
                   });
 
-    vm::utils::print(inst_stream);
-
     if (vinstr.mnemonic != vm::instrs::mnemonic_t::unknown) {
       if (vinstr.imm.has_imm)
         std::printf("> %s %p\n",
@@ -189,6 +187,9 @@ bool emu_t::code_exec_callback(uc_engine* uc,
       else
         std::printf("> %s\n",
                     vm::instrs::get_profile(vinstr.mnemonic)->name.c_str());
+    } else {
+      vm::utils::print(inst_stream);
+      std::getchar();
     }
 
     if (vinstr.mnemonic == vm::instrs::mnemonic_t::jmp) {
