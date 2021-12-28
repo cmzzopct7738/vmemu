@@ -116,6 +116,7 @@ int __cdecl main(int argc, const char* argv[]) {
     const auto vm_entries = vm::locate::get_vm_entries(module_base, image_size);
     std::printf("> number of vm entries = %d\n", vm_entries.size());
 
+    // TODO: rewrite this, just testing get_vm_entries...
     for (const auto& [vm_entry_rva, encrypted_rva] : vm_entries) {
       vm::vmctx_t vmctx(module_base, image_base, image_size, vm_entry_rva);
       if (!vmctx.init()) {
@@ -134,6 +135,8 @@ int __cdecl main(int argc, const char* argv[]) {
             "reason...\n");
         return -1;
       }
+
+      // TODO: rewrite this... using it to define profiles atm...
       emu.emulate();
     }
   }
