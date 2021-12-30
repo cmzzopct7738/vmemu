@@ -59,6 +59,54 @@ bool emu_t::init() {
   return true;
 }
 
+vm::instrs::vinstr_t emu_t::step() {
+  m_single_step.m_toggle = true;
+  uc_err err;
+  std::uintptr_t rip = m_vm->m_vm_entry_rva + m_vm->m_module_base,
+                 rsp = STACK_BASE + STACK_SIZE - PAGE_4KB;
+
+  if ((err = uc_reg_write(uc, UC_X86_REG_RSP, &rsp))) {
+    std::printf("> uc_reg_write error, reason = %d\n", err);
+    return;
+  }
+
+  if ((err = uc_reg_write(uc, UC_X86_REG_RIP, &rip))) {
+    std::printf("> uc_reg_write error, reason = %d\n", err);
+    return;
+  }
+
+  cc_trace.m_uc = uc;
+  cc_trace.m_vip = vip;
+  cc_trace.m_vsp = vsp;
+
+  // -- if there is already exists a cpu context back up then restore from it...
+  if (m_single_step.cpu_context) {
+    uc_context_restore(uc, m_single_step.cpu_context);
+    uc_mem_write(uc, STACK_BASE, m_single_step.stack, STACK_SIZE);
+  }
+
+  // -- single step emulate...
+  std::printf("> beginning execution at = %p\n", rip);
+  if ((err = uc_emu_start(uc, rip, 0ull, 0ull, 0ull))) {
+    std::printf("> error starting emu... reason = %d\n", err);
+    return;
+  }
+
+  // -- allocate new memory context...
+  if (!m_single_step.cpu_context) {
+    uc_context* ctx;
+    uc_context_alloc(uc, &ctx);
+    m_single_step.cpu_context = ctx;
+  }
+
+  // -- save cpu and stack...
+  uc_context_save(uc, m_single_step.cpu_context);
+  uc_mem_read(uc, STACK_BASE, m_single_step.stack, STACK_SIZE);
+
+  m_single_step.m_toggle = false;
+  return vinstrs.back();
+}
+
 void emu_t::emulate() {
   uc_err err;
   std::uintptr_t rip = m_vm->m_vm_entry_rva + m_vm->m_module_base,
@@ -83,6 +131,9 @@ void emu_t::emulate() {
     std::printf("> error starting emu... reason = %d\n", err);
     return;
   }
+
+  const auto jcc_result = has_jcc(vinstrs);
+  std::printf("> jcc result = %d\n", jcc_result.has_value());
 }
 
 void emu_t::int_callback(uc_engine* uc, std::uint32_t intno, emu_t* obj) {
@@ -196,16 +247,16 @@ bool emu_t::code_exec_callback(uc_engine* uc,
     obj->cc_trace.m_vsp = obj->vsp;
     obj->vinstrs.push_back(vinstr);
 
-    // free the trace since we will start a new one...
+    // -- free the trace since we will start a new one...
     std::for_each(obj->cc_trace.m_instrs.begin(), obj->cc_trace.m_instrs.end(),
                   [&](const vm::instrs::emu_instr_t& instr) {
                     uc_context_free(instr.m_cpu);
                   });
 
     obj->cc_trace.m_instrs.clear();
-
     if (vinstr.mnemonic == vm::instrs::mnemonic_t::jmp ||
-        vinstr.mnemonic == vm::instrs::mnemonic_t::vmexit)
+        vinstr.mnemonic == vm::instrs::mnemonic_t::vmexit ||
+        obj->m_single_step.m_toggle)
       uc_emu_stop(obj->uc);
   }
   return true;
@@ -248,5 +299,23 @@ void emu_t::invalid_mem(uc_engine* uc,
     default:
       break;
   }
+}
+
+std::optional<std::pair<std::uintptr_t, std::uintptr_t>> emu_t::has_jcc(
+    std::vector<vm::instrs::vinstr_t>& vinstrs) {
+  if (vinstrs.back().mnemonic == vm::instrs::mnemonic_t::vmexit)
+    return {};
+
+  // number of LCONST virtual instructions which load 64bit imm's...
+  const std::uint32_t lconst_num = std::accumulate(
+      vinstrs.begin(), vinstrs.end(), 0,
+      [&](std::uint32_t val, vm::instrs::vinstr_t& v) -> std::uint32_t {
+        return v.mnemonic == vm::instrs::mnemonic_t::lconst && v.imm.size == 64
+                   ? ++val
+                   : val;
+      });
+
+  std::printf("> number of LCONST = %d\n", lconst_num);
+  return {};
 }
 }  // namespace vm
