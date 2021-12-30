@@ -3,10 +3,7 @@
 #include <iostream>
 #include <thread>
 #include <vmlocate.hpp>
-
 #include "vmemu_t.hpp"
-
-#define NUM_THREADS 20
 
 int __cdecl main(int argc, const char* argv[]) {
   argparse::argument_parser_t parser("VMEmu",
@@ -116,28 +113,28 @@ int __cdecl main(int argc, const char* argv[]) {
     const auto vm_entries = vm::locate::get_vm_entries(module_base, image_size);
     std::printf("> number of vm entries = %d\n", vm_entries.size());
 
-    // TODO: rewrite this, just testing get_vm_entries...
-    for (const auto& [vm_entry_rva, encrypted_rva] : vm_entries) {
-      vm::vmctx_t vmctx(module_base, image_base, image_size, vm_entry_rva);
-      if (!vmctx.init()) {
-        std::printf(
-            "[!] failed to init vmctx... this can be for many reasons..."
-            " try validating your vm entry rva... make sure the binary is "
-            "unpacked and is"
-            "protected with VMProtect 3...\n");
-        return -1;
-      }
+    const auto vm_entry_rva =
+        std::strtoull(parser.get<std::string>("vmentry").c_str(), nullptr, 16);
 
-      vm::emu_t emu(&vmctx);
-      if (!emu.init()) {
-        std::printf(
-            "[!] failed to init vm::emu_t... read above in the console for the "
-            "reason...\n");
-        return -1;
-      }
-
-      // TODO: rewrite this... using it to define profiles atm...
-      emu.emulate();
+    vm::vmctx_t vmctx(module_base, image_base, image_size, vm_entry_rva);
+    if (!vmctx.init()) {
+      std::printf(
+          "[!] failed to init vmctx... this can be for many reasons..."
+          " try validating your vm entry rva... make sure the binary is "
+          "unpacked and is"
+          "protected with VMProtect 3...\n");
+      return -1;
     }
+
+    vm::emu_t emu(&vmctx);
+    if (!emu.init()) {
+      std::printf(
+          "[!] failed to init vm::emu_t... read above in the console for the "
+          "reason...\n");
+      return -1;
+    }
+
+    // TODO: rewrite this... using it to define profiles atm...
+    emu.emulate();
   }
 }

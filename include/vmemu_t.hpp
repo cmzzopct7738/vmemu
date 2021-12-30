@@ -21,6 +21,8 @@ class emu_t {
   uc_engine* uc;
   const vm::vmctx_t* m_vm;
   zydis_reg_t vip, vsp;
+
+  std::vector<vm::instrs::vinstr_t> vinstrs;
   vm::instrs::hndlr_trace_t cc_trace;
   uc_hook code_exec_hook, invalid_mem_hook, int_hook;
 
@@ -29,12 +31,13 @@ class emu_t {
                                  uint32_t size,
                                  emu_t* obj);
 
-  static void int_callback(uc_engine* uc, std::uint32_t intno, emu_t* obj);
   static void invalid_mem(uc_engine* uc,
                           uc_mem_type type,
                           uint64_t address,
                           int size,
                           int64_t value,
                           emu_t* obj);
+
+  static void int_callback(uc_engine* uc, std::uint32_t intno, emu_t* obj);
 };
 }  // namespace vm

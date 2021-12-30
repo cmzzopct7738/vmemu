@@ -192,10 +192,9 @@ bool emu_t::code_exec_callback(uc_engine* uc,
       std::getchar();
     }
 
-    if (vinstr.mnemonic == vm::instrs::mnemonic_t::jmp) {
-      obj->cc_trace.m_vip = obj->vip;
-      obj->cc_trace.m_vsp = obj->vsp;
-    }
+    obj->cc_trace.m_vip = obj->vip;
+    obj->cc_trace.m_vsp = obj->vsp;
+    obj->vinstrs.push_back(vinstr);
 
     // free the trace since we will start a new one...
     std::for_each(obj->cc_trace.m_instrs.begin(), obj->cc_trace.m_instrs.end(),
@@ -204,6 +203,10 @@ bool emu_t::code_exec_callback(uc_engine* uc,
                   });
 
     obj->cc_trace.m_instrs.clear();
+
+    if (vinstr.mnemonic == vm::instrs::mnemonic_t::jmp ||
+        vinstr.mnemonic == vm::instrs::mnemonic_t::vmexit)
+      uc_emu_stop(obj->uc);
   }
   return true;
 }
