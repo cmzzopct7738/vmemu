@@ -1,10 +1,11 @@
- [project]
+[project]
 name = "vmemu"
 
 [subdir.deps]
+[subdir.tools]
 
 [target.vmemu]
-type = "executable"
+type = "static"
 
 sources = [
     "src/**.cpp",

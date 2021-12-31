@@ -2,8 +2,8 @@
 #include <fstream>
 #include <iostream>
 #include <thread>
+#include <vmemu_t.hpp>
 #include <vmlocate.hpp>
-#include "vmemu_t.hpp"
 
 int __cdecl main(int argc, const char* argv[]) {
   argparse::argument_parser_t parser("VMEmu",

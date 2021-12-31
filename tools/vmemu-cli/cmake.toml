@@ -1,0 +1,8 @@
+[project]
+name = "vmemu-cli"
+
+[target.vmemu-cli]
+type = "executable"
+
+sources = ["src/**.cpp"]
+link-libraries = ["vmemu"]
