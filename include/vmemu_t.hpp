@@ -18,32 +18,19 @@ class emu_t {
   explicit emu_t(vm::vmctx_t* vm_ctx);
   ~emu_t();
   bool init();
-  void emulate();
-
-  /// <summary>
-  /// emulates a single virtual instruction and returns it... this function is
-  /// used internally to determine if virtual JCC addresses are legit...
-  /// </summary>
-  /// <returns>returns the single virtual instruction that was
-  /// emulated...</returns>
-  vm::instrs::vinstr_t step();
+  bool emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn);
 
  private:
   uc_engine* uc;
   const vm::vmctx_t* m_vm;
   zydis_reg_t vip, vsp;
+  vm::instrs::hndlr_trace_t cc_trace;
+  vm::instrs::vblk_t* cc_blk;
 
   /// <summary>
-  /// single step structure information...
+  /// set to true when emulating the vm enter...
   /// </summary>
-  struct {
-    bool m_toggle;
-    uc_context* cpu_context;
-    std::uint8_t stack[STACK_SIZE];
-  } m_single_step;
-
-  std::vector<vm::instrs::vinstr_t> vinstrs;
-  vm::instrs::hndlr_trace_t cc_trace;
+  bool m_vm_enter;
 
   /// <summary>
   /// unicorn engine hook

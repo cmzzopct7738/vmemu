@@ -59,81 +59,42 @@ bool emu_t::init() {
   return true;
 }
 
-vm::instrs::vinstr_t emu_t::step() {
-  m_single_step.m_toggle = true;
+bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
   uc_err err;
-  std::uintptr_t rip = m_vm->m_vm_entry_rva + m_vm->m_module_base,
+  std::uintptr_t rip = vmenter_rva + m_vm->m_module_base,
                  rsp = STACK_BASE + STACK_SIZE - PAGE_4KB;
 
   if ((err = uc_reg_write(uc, UC_X86_REG_RSP, &rsp))) {
     std::printf("> uc_reg_write error, reason = %d\n", err);
-    return;
+    return false;
   }
 
   if ((err = uc_reg_write(uc, UC_X86_REG_RIP, &rip))) {
     std::printf("> uc_reg_write error, reason = %d\n", err);
-    return;
+    return false;
   }
 
   cc_trace.m_uc = uc;
   cc_trace.m_vip = vip;
   cc_trace.m_vsp = vsp;
+  vrtn.m_rva = vmenter_rva;
+  m_vm_enter = true;
 
-  // -- if there is already exists a cpu context back up then restore from it...
-  if (m_single_step.cpu_context) {
-    uc_context_restore(uc, m_single_step.cpu_context);
-    uc_mem_write(uc, STACK_BASE, m_single_step.stack, STACK_SIZE);
-  }
-
-  // -- single step emulate...
-  std::printf("> beginning execution at = %p\n", rip);
-  if ((err = uc_emu_start(uc, rip, 0ull, 0ull, 0ull))) {
-    std::printf("> error starting emu... reason = %d\n", err);
-    return;
-  }
-
-  // -- allocate new memory context...
-  if (!m_single_step.cpu_context) {
-    uc_context* ctx;
-    uc_context_alloc(uc, &ctx);
-    m_single_step.cpu_context = ctx;
-  }
-
-  // -- save cpu and stack...
-  uc_context_save(uc, m_single_step.cpu_context);
-  uc_mem_read(uc, STACK_BASE, m_single_step.stack, STACK_SIZE);
-
-  m_single_step.m_toggle = false;
-  return vinstrs.back();
-}
-
-void emu_t::emulate() {
-  uc_err err;
-  std::uintptr_t rip = m_vm->m_vm_entry_rva + m_vm->m_module_base,
-                 rsp = STACK_BASE + STACK_SIZE - PAGE_4KB;
-
-  if ((err = uc_reg_write(uc, UC_X86_REG_RSP, &rsp))) {
-    std::printf("> uc_reg_write error, reason = %d\n", err);
-    return;
-  }
-
-  if ((err = uc_reg_write(uc, UC_X86_REG_RIP, &rip))) {
-    std::printf("> uc_reg_write error, reason = %d\n", err);
-    return;
-  }
-
-  cc_trace.m_uc = uc;
-  cc_trace.m_vip = vip;
-  cc_trace.m_vsp = vsp;
+  vm::instrs::vblk_t blk;
+  blk.m_vip = {0ull, 0ull};
+  blk.m_cpu = {nullptr, nullptr};
+  cc_blk = &blk;
 
   std::printf("> beginning execution at = %p\n", rip);
   if ((err = uc_emu_start(uc, rip, 0ull, 0ull, 0ull))) {
     std::printf("> error starting emu... reason = %d\n", err);
-    return;
+    return false;
   }
 
-  const auto jcc_result = has_jcc(vinstrs);
+  std::printf("> blk address = %p\n", blk.m_vip.img_base);
+  const auto jcc_result = has_jcc(blk.m_vinstrs);
   std::printf("> jcc result = %d\n", jcc_result.has_value());
+  return true;
 }
 
 void emu_t::int_callback(uc_engine* uc, std::uint32_t intno, emu_t* obj) {
@@ -194,7 +155,10 @@ bool emu_t::code_exec_callback(uc_engine* uc,
   uc_context_alloc(obj->uc, &cpu_ctx);
   uc_context_save(obj->uc, cpu_ctx);
 
-  vm::instrs::emu_instr_t emu_instr{instr, cpu_ctx};
+  std::uint8_t* stack = reinterpret_cast<std::uint8_t*>(malloc(STACK_SIZE));
+  uc_mem_read(uc, STACK_BASE, stack, STACK_SIZE);
+
+  vm::instrs::emu_instr_t emu_instr{instr, cpu_ctx, stack};
   obj->cc_trace.m_instrs.push_back(emu_instr);
 
   // RET or JMP REG means the end of a vm handler...
@@ -221,43 +185,92 @@ bool emu_t::code_exec_callback(uc_engine* uc,
       obj->cc_trace.m_instrs.erase((rva_fetch + 1).base(),
                                    obj->cc_trace.m_instrs.end());
 
-    const auto vinstr =
-        vm::instrs::determine(obj->vip, obj->vsp, obj->cc_trace);
+    // extract vip address out of the vm enter trace...
+    if (obj->m_vm_enter) {
+      auto vip_addr_set = std::find_if(
+          obj->cc_trace.m_instrs.rbegin(), obj->cc_trace.m_instrs.rend(),
+          [&vip = obj->vip](vm::instrs::emu_instr_t& emu_instr) -> bool {
+            const auto& i = emu_instr.m_instr;
+            return i.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                   i.operands[0].reg.value == vip;
+          });
 
-    zydis_rtn_t inst_stream;
-    std::for_each(obj->cc_trace.m_instrs.begin(), obj->cc_trace.m_instrs.end(),
-                  [&](vm::instrs::emu_instr_t& instr) {
-                    inst_stream.push_back({instr.m_instr});
-                  });
+      // get the cpu context from the instruction after the instruction that
+      // writes to vip...
+      --vip_addr_set;
 
-    if (vinstr.mnemonic != vm::instrs::mnemonic_t::unknown) {
-      if (vinstr.imm.has_imm)
-        std::printf("> %s %p\n",
-                    vm::instrs::get_profile(vinstr.mnemonic)->name.c_str(),
-                    vinstr.imm.val);
-      else
-        std::printf("> %s\n",
-                    vm::instrs::get_profile(vinstr.mnemonic)->name.c_str());
+      uc_context* backup;
+      uc_context_alloc(uc, &backup);
+      uc_context_save(uc, backup);
+      uc_context_restore(uc, vip_addr_set->m_cpu);
+
+      std::uintptr_t vip_addr = 0ull;
+      uc_reg_read(uc, vm::instrs::reg_map[obj->vip], &vip_addr);
+      obj->cc_blk->m_vip.rva = vip_addr -= obj->m_vm->m_module_base;
+      obj->cc_blk->m_vip.img_base = vip_addr += obj->m_vm->m_image_base;
+
+      uc_context_restore(uc, backup);
+      uc_context_free(backup);
+      obj->m_vm_enter = false;
     } else {
-      vm::utils::print(inst_stream);
-      std::getchar();
-    }
+      const auto vinstr =
+          vm::instrs::determine(obj->vip, obj->vsp, obj->cc_trace);
 
-    obj->cc_trace.m_vip = obj->vip;
-    obj->cc_trace.m_vsp = obj->vsp;
-    obj->vinstrs.push_back(vinstr);
+      if (vinstr.mnemonic != vm::instrs::mnemonic_t::unknown) {
+        if (vinstr.imm.has_imm)
+          std::printf("> %s %p\n",
+                      vm::instrs::get_profile(vinstr.mnemonic)->name.c_str(),
+                      vinstr.imm.val);
+        else
+          std::printf("> %s\n",
+                      vm::instrs::get_profile(vinstr.mnemonic)->name.c_str());
+      } else {
+        zydis_rtn_t inst_stream;
+        std::for_each(obj->cc_trace.m_instrs.begin(),
+                      obj->cc_trace.m_instrs.end(),
+                      [&](vm::instrs::emu_instr_t& instr) {
+                        inst_stream.push_back({instr.m_instr});
+                      });
+
+        vm::utils::print(inst_stream);
+        std::getchar();
+      }
+
+      obj->cc_trace.m_vip = obj->vip;
+      obj->cc_trace.m_vsp = obj->vsp;
+      obj->cc_blk->m_vinstrs.push_back(vinstr);
+
+      if (vinstr.mnemonic == vm::instrs::mnemonic_t::jmp) {
+        uc_context *b1, *b2;
+        uc_context_alloc(uc, &b1);
+        uc_context_alloc(uc, &b2);
+        uc_context_save(uc, b1);
+        uc_context_restore(uc, obj->cc_trace.m_instrs.begin()->m_cpu);
+        uc_context_save(uc, b2);
+        uc_context_restore(uc, b1);
+
+        std::uint8_t* stack =
+            reinterpret_cast<std::uint8_t*>(malloc(STACK_SIZE));
+
+        std::memcpy(stack, obj->cc_trace.m_instrs.begin()->stack, STACK_SIZE);
+
+        obj->cc_blk->m_cpu.ctx = b2;
+        obj->cc_blk->m_cpu.stack = stack;
+      }
+
+      if (vinstr.mnemonic == vm::instrs::mnemonic_t::jmp ||
+          vinstr.mnemonic == vm::instrs::mnemonic_t::vmexit)
+        uc_emu_stop(obj->uc);
+    }
 
     // -- free the trace since we will start a new one...
     std::for_each(obj->cc_trace.m_instrs.begin(), obj->cc_trace.m_instrs.end(),
                   [&](const vm::instrs::emu_instr_t& instr) {
                     uc_context_free(instr.m_cpu);
+                    free(instr.stack);
                   });
 
     obj->cc_trace.m_instrs.clear();
-    if (vinstr.mnemonic == vm::instrs::mnemonic_t::jmp ||
-        vinstr.mnemonic == vm::instrs::mnemonic_t::vmexit ||
-        obj->m_single_step.m_toggle)
-      uc_emu_stop(obj->uc);
   }
   return true;
 }
@@ -315,7 +328,35 @@ std::optional<std::pair<std::uintptr_t, std::uintptr_t>> emu_t::has_jcc(
                    : val;
       });
 
-  std::printf("> number of LCONST = %d\n", lconst_num);
+  if (lconst_num < 3)
+    return {};
+
+  const auto lconst1 = std::find_if(
+      vinstrs.rbegin(), vinstrs.rend(), [&](vm::instrs::vinstr_t& v) -> bool {
+        return v.mnemonic == vm::instrs::mnemonic_t::lconst && v.imm.size == 64;
+      });
+
+  const auto lconst2 = std::find_if(
+      lconst1 + 1, vinstrs.rend(), [&](vm::instrs::vinstr_t& v) -> bool {
+        return v.mnemonic == vm::instrs::mnemonic_t::lconst && v.imm.size == 64;
+      });
+
+  static const auto exec_callbk = [&](uc_engine* uc, uint64_t address,
+                                      uint32_t size, emu_t* obj) {};
+
+  uc_context *backup, *br1, *br2;
+  uc_context_alloc(uc, &backup);
+  uc_context_alloc(uc, &br1);
+  uc_context_alloc(uc, &br2);
+  uc_context_save(uc, backup);
+
+  uc_context_restore(uc, cc_blk->m_cpu.ctx);
+  uc_mem_write(uc, STACK_BASE, cc_blk->m_cpu.stack, STACK_SIZE);
+
+  uc_context_restore(uc, backup);
+  uc_context_free(backup);
+  uc_context_free(br1);
+  uc_context_free(br2);
   return {};
 }
 }  // namespace vm

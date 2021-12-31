@@ -135,6 +135,7 @@ int __cdecl main(int argc, const char* argv[]) {
     }
 
     // TODO: rewrite this... using it to define profiles atm...
-    emu.emulate();
+    vm::instrs::vrtn_t virt_rtn;
+    emu.emulate(vm_entry_rva, virt_rtn);
   }
 }
