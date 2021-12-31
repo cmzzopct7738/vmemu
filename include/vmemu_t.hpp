@@ -24,13 +24,22 @@ class emu_t {
   uc_engine* uc;
   const vm::vmctx_t* m_vm;
   zydis_reg_t vip, vsp;
+
+  /// <summary>
+  /// current code trace...
+  /// </summary>
   vm::instrs::hndlr_trace_t cc_trace;
+
+  /// <summary>
+  /// current virtual code block...
+  /// block...
+  /// </summary>
   vm::instrs::vblk_t* cc_blk;
 
   /// <summary>
-  /// set to true when emulating the vm enter...
+  /// current code virtual routine...
   /// </summary>
-  bool m_vm_enter;
+  vm::instrs::vrtn_t* cc_vrtn;
 
   /// <summary>
   /// unicorn engine hook
@@ -80,13 +89,21 @@ class emu_t {
   static void int_callback(uc_engine* uc, std::uint32_t intno, emu_t* obj);
 
   /// <summary>
-  /// determines if there is a JCC in the virtual instruction stream, if there
-  /// is returns a pair of image based addresses for both of the branches...
+  /// determines if its possible that the virtual instruction stream contains a
+  /// virtual JCC...
+  ///
+  /// this simply checks to see if there are at least 3 LCONST that load 64bit
+  /// constant values...
+  ///
+  /// it also checks if the last 2 LCONST's load image based addresses which
+  /// land inside of executable sections...
+  ///
+  /// this function cannot be used to determine if there is a virtual branch or
+  /// not... it is only a useful/preliminary function...
   /// </summary>
   /// <param name="vinstrs">vector of virtual instructions...</param>
-  /// <returns>returns a pair of imaged based addresses, one for each branch
-  /// address... if there is no jcc then it returns nothing...</returns>
-  std::optional<std::pair<std::uintptr_t, std::uintptr_t>> has_jcc(
-      std::vector<vm::instrs::vinstr_t>& vinstrs);
+  /// <returns>returns true if there is at least 3 LCONST in the virtual
+  /// instruction stream that load 64bit values...</returns>
+  bool could_have_jcc(std::vector<vm::instrs::vinstr_t>& vinstrs);
 };
 }  // namespace vm

@@ -78,12 +78,12 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
   cc_trace.m_vip = vip;
   cc_trace.m_vsp = vsp;
   vrtn.m_rva = vmenter_rva;
-  m_vm_enter = true;
 
   vm::instrs::vblk_t blk;
   blk.m_vip = {0ull, 0ull};
-  blk.m_cpu = {nullptr, nullptr};
+
   cc_blk = &blk;
+  cc_vrtn = &vrtn;
 
   std::printf("> beginning execution at = %p\n", rip);
   if ((err = uc_emu_start(uc, rip, 0ull, 0ull, 0ull))) {
@@ -91,9 +91,9 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
     return false;
   }
 
-  std::printf("> blk address = %p\n", blk.m_vip.img_base);
-  const auto jcc_result = has_jcc(blk.m_vinstrs);
-  std::printf("> jcc result = %d\n", jcc_result.has_value());
+  std::printf(
+      "> blk_%p, number of virtual instructions = %d, could have a jcc = %d\n",
+      blk.m_vip.img_base, blk.m_vinstrs.size(), could_have_jcc(blk.m_vinstrs));
   return true;
 }
 
@@ -148,18 +148,17 @@ bool emu_t::code_exec_callback(uc_engine* uc,
   if (instr.mnemonic == ZYDIS_MNEMONIC_INVALID)
     return false;
 
-  // save the current cpu's context (all register values and such)...
-  // create a new emu_instr_t with this information... this info will be used by
-  // profiles to grab decrypted values and such...
-  uc_context* cpu_ctx;
-  uc_context_alloc(obj->uc, &cpu_ctx);
-  uc_context_save(obj->uc, cpu_ctx);
+  uc_context* ctx;
+  uc_context_alloc(uc, &ctx);
+  uc_context_save(uc, ctx);
 
-  std::uint8_t* stack = reinterpret_cast<std::uint8_t*>(malloc(STACK_SIZE));
-  uc_mem_read(uc, STACK_BASE, stack, STACK_SIZE);
+  // if this is the first instruction of this handler then save the stack...
+  if (!obj->cc_trace.m_instrs.size()) {
+    obj->cc_trace.m_stack = reinterpret_cast<std::uint8_t*>(malloc(STACK_SIZE));
+    uc_mem_read(uc, STACK_BASE, obj->cc_trace.m_stack, STACK_SIZE);
+  }
 
-  vm::instrs::emu_instr_t emu_instr{instr, cpu_ctx, stack};
-  obj->cc_trace.m_instrs.push_back(emu_instr);
+  obj->cc_trace.m_instrs.push_back({instr, ctx});
 
   // RET or JMP REG means the end of a vm handler...
   if (instr.mnemonic == ZYDIS_MNEMONIC_RET ||
@@ -185,33 +184,32 @@ bool emu_t::code_exec_callback(uc_engine* uc,
       obj->cc_trace.m_instrs.erase((rva_fetch + 1).base(),
                                    obj->cc_trace.m_instrs.end());
 
-    // extract vip address out of the vm enter trace...
-    if (obj->m_vm_enter) {
-      auto vip_addr_set = std::find_if(
+    // set the virtual code block vip address information...
+    if (!obj->cc_blk->m_vip.rva || !obj->cc_blk->m_vip.img_base) {
+      auto vip_write = std::find_if(
           obj->cc_trace.m_instrs.rbegin(), obj->cc_trace.m_instrs.rend(),
-          [&vip = obj->vip](vm::instrs::emu_instr_t& emu_instr) -> bool {
-            const auto& i = emu_instr.m_instr;
+          [&vip = obj->vip](vm::instrs::emu_instr_t& instr) -> bool {
+            const auto& i = instr.m_instr;
             return i.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
                    i.operands[0].reg.value == vip;
           });
 
-      // get the cpu context from the instruction after the instruction that
-      // writes to vip...
-      --vip_addr_set;
-
       uc_context* backup;
       uc_context_alloc(uc, &backup);
       uc_context_save(uc, backup);
-      uc_context_restore(uc, vip_addr_set->m_cpu);
+      uc_context_restore(uc, (vip_write - 1)->m_cpu);
+
+      auto uc_reg =
+          vm::instrs::reg_map[vip_write->m_instr.operands[0].reg.value];
 
       std::uintptr_t vip_addr = 0ull;
-      uc_reg_read(uc, vm::instrs::reg_map[obj->vip], &vip_addr);
+      uc_reg_read(uc, uc_reg, &vip_addr);
+
       obj->cc_blk->m_vip.rva = vip_addr -= obj->m_vm->m_module_base;
       obj->cc_blk->m_vip.img_base = vip_addr += obj->m_vm->m_image_base;
 
       uc_context_restore(uc, backup);
       uc_context_free(backup);
-      obj->m_vm_enter = false;
     } else {
       const auto vinstr =
           vm::instrs::determine(obj->vip, obj->vsp, obj->cc_trace);
@@ -241,21 +239,25 @@ bool emu_t::code_exec_callback(uc_engine* uc,
       obj->cc_blk->m_vinstrs.push_back(vinstr);
 
       if (vinstr.mnemonic == vm::instrs::mnemonic_t::jmp) {
-        uc_context *b1, *b2;
-        uc_context_alloc(uc, &b1);
-        uc_context_alloc(uc, &b2);
-        uc_context_save(uc, b1);
+        uc_context *backup, *copy;
+
+        // backup current unicorn-engine context...
+        uc_context_alloc(uc, &backup);
+        uc_context_alloc(uc, &copy);
+        uc_context_save(uc, backup);
+
+        // make a copy of the first cpu context of the jmp handler...
         uc_context_restore(uc, obj->cc_trace.m_instrs.begin()->m_cpu);
-        uc_context_save(uc, b2);
-        uc_context_restore(uc, b1);
+        uc_context_save(uc, copy);
 
-        std::uint8_t* stack =
-            reinterpret_cast<std::uint8_t*>(malloc(STACK_SIZE));
+        // restore the unicorn-engine context... also free the backup...
+        uc_context_restore(uc, backup);
+        uc_context_free(backup);
 
-        std::memcpy(stack, obj->cc_trace.m_instrs.begin()->stack, STACK_SIZE);
-
-        obj->cc_blk->m_cpu.ctx = b2;
-        obj->cc_blk->m_cpu.stack = stack;
+        // set current code block virtual jmp instruction information...
+        obj->cc_blk->m_jmp.ctx = copy;
+        obj->cc_blk->m_jmp.stack = new std::uint8_t[STACK_SIZE];
+        uc_mem_read(uc, STACK_BASE, obj->cc_blk->m_jmp.stack, STACK_SIZE);
       }
 
       if (vinstr.mnemonic == vm::instrs::mnemonic_t::jmp ||
@@ -267,9 +269,9 @@ bool emu_t::code_exec_callback(uc_engine* uc,
     std::for_each(obj->cc_trace.m_instrs.begin(), obj->cc_trace.m_instrs.end(),
                   [&](const vm::instrs::emu_instr_t& instr) {
                     uc_context_free(instr.m_cpu);
-                    free(instr.stack);
                   });
 
+    free(obj->cc_trace.m_stack);
     obj->cc_trace.m_instrs.clear();
   }
   return true;
@@ -314,49 +316,51 @@ void emu_t::invalid_mem(uc_engine* uc,
   }
 }
 
-std::optional<std::pair<std::uintptr_t, std::uintptr_t>> emu_t::has_jcc(
-    std::vector<vm::instrs::vinstr_t>& vinstrs) {
-  if (vinstrs.back().mnemonic == vm::instrs::mnemonic_t::vmexit)
-    return {};
+bool emu_t::could_have_jcc(std::vector<vm::instrs::vinstr_t>& vinstrs) {
+  // check to see if there is at least 3 LCONST %i64's
+  if (std::accumulate(
+          vinstrs.begin(), vinstrs.end(), 0u,
+          [&](std::uint32_t val, vm::instrs::vinstr_t& v) -> std::uint32_t {
+            return v.mnemonic == vm::instrs::mnemonic_t::lconst &&
+                           v.imm.size == 64
+                       ? ++val
+                       : val;
+          }) < 3)
+    return false;
 
-  // number of LCONST virtual instructions which load 64bit imm's...
-  const std::uint32_t lconst_num = std::accumulate(
-      vinstrs.begin(), vinstrs.end(), 0,
-      [&](std::uint32_t val, vm::instrs::vinstr_t& v) -> std::uint32_t {
-        return v.mnemonic == vm::instrs::mnemonic_t::lconst && v.imm.size == 64
-                   ? ++val
-                   : val;
-      });
+  // extract the lconst64's out of the virtual instruction stream...
+  static const auto lconst64_chk = [&](vm::instrs::vinstr_t& v) -> bool {
+    return v.mnemonic == vm::instrs::mnemonic_t::lconst && v.imm.size == 64;
+  };
 
-  if (lconst_num < 3)
-    return {};
+  const auto lconst1 =
+      std::find_if(vinstrs.rbegin(), vinstrs.rend(), lconst64_chk);
 
-  const auto lconst1 = std::find_if(
-      vinstrs.rbegin(), vinstrs.rend(), [&](vm::instrs::vinstr_t& v) -> bool {
-        return v.mnemonic == vm::instrs::mnemonic_t::lconst && v.imm.size == 64;
-      });
+  if (lconst1 == vinstrs.rend())
+    return false;
 
-  const auto lconst2 = std::find_if(
-      lconst1 + 1, vinstrs.rend(), [&](vm::instrs::vinstr_t& v) -> bool {
-        return v.mnemonic == vm::instrs::mnemonic_t::lconst && v.imm.size == 64;
-      });
+  const auto lconst2 = std::find_if(lconst1 + 1, vinstrs.rend(), lconst64_chk);
 
-  static const auto exec_callbk = [&](uc_engine* uc, uint64_t address,
-                                      uint32_t size, emu_t* obj) {};
+  if (lconst2 == vinstrs.rend())
+    return false;
 
-  uc_context *backup, *br1, *br2;
-  uc_context_alloc(uc, &backup);
-  uc_context_alloc(uc, &br1);
-  uc_context_alloc(uc, &br2);
-  uc_context_save(uc, backup);
+  // check to see if the imm val is inside of the image...
+  if (lconst1->imm.val > m_vm->m_image_base + m_vm->m_image_size ||
+      lconst1->imm.val < m_vm->m_image_base ||
+      lconst2->imm.val > m_vm->m_image_base + m_vm->m_image_size ||
+      lconst2->imm.val < m_vm->m_image_base)
+    return false;
 
-  uc_context_restore(uc, cc_blk->m_cpu.ctx);
-  uc_mem_write(uc, STACK_BASE, cc_blk->m_cpu.stack, STACK_SIZE);
+  // check to see if the imm's points to something inside of an executable
+  // section...
+  if (!vm::utils::scn::executable(
+          m_vm->m_module_base,
+          (lconst1->imm.val - m_vm->m_image_base) + m_vm->m_module_base) ||
+      !vm::utils::scn::executable(
+          m_vm->m_module_base,
+          (lconst2->imm.val - m_vm->m_image_base) + m_vm->m_module_base))
+    return false;
 
-  uc_context_restore(uc, backup);
-  uc_context_free(backup);
-  uc_context_free(br1);
-  uc_context_free(br2);
-  return {};
+  return true;
 }
 }  // namespace vm
