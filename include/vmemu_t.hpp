@@ -125,5 +125,11 @@ class emu_t {
   /// <param name="branch_addr"></param>
   /// <returns></returns>
   bool legit_branch(vm::instrs::vblk_t& vblk, std::uintptr_t branch_addr);
+
+  void emulate_branch(uc_context* ctx,
+                      std::uint8_t* stack,
+                      std::uintptr_t branch_addr,
+                      zydis_reg_t vsp,
+                      vm::instrs::vblk_t& vblk);
 };
 }  // namespace vm

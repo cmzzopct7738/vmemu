@@ -112,11 +112,56 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
       blk.branch_type = vm::instrs::vbranch_type::jcc;
       std::printf("> code block has jcc, b1 = %p, b2 = %p\n", b1, b2);
     } else {
+      uc_context* backup;
+      std::uint8_t* stack = new std::uint8_t[STACK_SIZE];
+      uc_mem_read(uc, STACK_BASE, stack, STACK_SIZE);
+      uc_context_alloc(uc, &backup);
+      uc_context_save(uc, backup);
+      uc_context_restore(uc, blk.m_jmp.ctx);
+
+      std::uintptr_t vsp_ptr = 0ull, branch_addr = 0ull;
+      uc_reg_read(uc, vm::instrs::reg_map[blk.m_vm.vsp], &vsp_ptr);
+      uc_mem_read(uc, vsp_ptr, &branch_addr, sizeof branch_addr);
+
+      uc_context_restore(uc, backup);
+      uc_context_free(backup);
+      uc_mem_write(uc, STACK_BASE, stack, STACK_SIZE);
+      delete stack;
+
+      blk.branches.push_back(branch_addr);
       blk.branch_type = vm::instrs::vbranch_type::absolute;
-      std::printf("> code block has absolute jmp...\n");
+      std::printf("> code block has absolute jmp, b1 = %p\n", branch_addr);
     }
   }
   return true;
+}
+
+void emu_t::emulate_branch(uc_context* ctx,
+                           std::uint8_t* stack,
+                           std::uintptr_t branch_addr,
+                           zydis_reg_t vsp,
+                           vm::instrs::vblk_t& vblk) {
+  uc_context* backup;
+  std::uint8_t* stack_backup = new std::uint8_t[STACK_SIZE];
+  std::uintptr_t vsp_addr = 0ull, rip = 0ull;
+
+  uc_context_alloc(uc, &backup);
+  uc_context_save(uc, backup);
+  uc_mem_read(uc, STACK_BASE, stack_backup, STACK_SIZE);
+
+  uc_context_restore(uc, ctx);
+  uc_mem_write(uc, STACK_BASE, stack, STACK_SIZE);
+  uc_reg_read(uc, vm::instrs::reg_map[vsp], &vsp_addr);
+  uc_reg_read(uc, UC_X86_REG_RIP, &rip);
+  uc_mem_write(uc, vsp_addr, &branch_addr, sizeof branch_addr);
+
+  cc_blk = &vblk;
+  uc_emu_start(uc, rip, 0u, 0u, 0u);
+
+  uc_mem_write(uc, STACK_BASE, stack_backup, STACK_SIZE);
+  uc_context_restore(uc, backup);
+  uc_context_free(backup);
+  delete stack_backup;
 }
 
 void emu_t::int_callback(uc_engine* uc, std::uint32_t intno, emu_t* obj) {
@@ -342,36 +387,38 @@ bool emu_t::code_exec_callback(uc_engine* uc,
         std::getchar();
       }
 
+      if (obj->cc_blk->m_vinstrs.size()) {
+        if (vinstr.mnemonic == vm::instrs::mnemonic_t::jmp) {
+          uc_context *backup, *copy;
+
+          // backup current unicorn-engine context...
+          uc_context_alloc(uc, &backup);
+          uc_context_alloc(uc, &copy);
+          uc_context_save(uc, backup);
+
+          // make a copy of the first cpu context of the jmp handler...
+          uc_context_restore(uc, obj->cc_trace.m_instrs.begin()->m_cpu);
+          uc_context_save(uc, copy);
+
+          // restore the unicorn-engine context... also free the backup...
+          uc_context_restore(uc, backup);
+          uc_context_free(backup);
+
+          // set current code block virtual jmp instruction information...
+          obj->cc_blk->m_jmp.ctx = copy;
+          obj->cc_blk->m_jmp.stack = new std::uint8_t[STACK_SIZE];
+          std::memcpy(obj->cc_blk->m_jmp.stack, obj->cc_trace.m_stack,
+                      STACK_SIZE);
+        }
+
+        if (vinstr.mnemonic == vm::instrs::mnemonic_t::jmp ||
+            vinstr.mnemonic == vm::instrs::mnemonic_t::vmexit)
+          uc_emu_stop(obj->uc);
+      }
+
       obj->cc_trace.m_vip = obj->vip;
       obj->cc_trace.m_vsp = obj->vsp;
       obj->cc_blk->m_vinstrs.push_back(vinstr);
-
-      if (vinstr.mnemonic == vm::instrs::mnemonic_t::jmp) {
-        uc_context *backup, *copy;
-
-        // backup current unicorn-engine context...
-        uc_context_alloc(uc, &backup);
-        uc_context_alloc(uc, &copy);
-        uc_context_save(uc, backup);
-
-        // make a copy of the first cpu context of the jmp handler...
-        uc_context_restore(uc, obj->cc_trace.m_instrs.begin()->m_cpu);
-        uc_context_save(uc, copy);
-
-        // restore the unicorn-engine context... also free the backup...
-        uc_context_restore(uc, backup);
-        uc_context_free(backup);
-
-        // set current code block virtual jmp instruction information...
-        obj->cc_blk->m_jmp.ctx = copy;
-        obj->cc_blk->m_jmp.stack = new std::uint8_t[STACK_SIZE];
-        std::memcpy(obj->cc_blk->m_jmp.stack, obj->cc_trace.m_stack,
-                    STACK_SIZE);
-      }
-
-      if (vinstr.mnemonic == vm::instrs::mnemonic_t::jmp ||
-          vinstr.mnemonic == vm::instrs::mnemonic_t::vmexit)
-        uc_emu_stop(obj->uc);
     }
 
     // -- free the trace since we will start a new one...
@@ -434,7 +481,14 @@ bool emu_t::legit_branch(vm::instrs::vblk_t& vblk, std::uintptr_t branch_addr) {
               (void*)&vm::emu_t::branch_pred_spec_exec, this,
               m_vm->m_module_base, m_vm->m_module_base + m_vm->m_image_size);
 
-  // restore cpu and stack...
+  // -- make a backup of the current emulation state...
+  uc_context* backup;
+  uc_context_alloc(uc, &backup);
+  uc_context_save(uc, backup);
+  std::uint8_t* stack = new std::uint8_t[STACK_SIZE];
+  uc_mem_read(uc, STACK_BASE, stack, STACK_SIZE);
+
+  // restore cpu and stack back to the virtual jump handler...
   uc_context_restore(uc, vblk.m_jmp.ctx);
   uc_mem_write(uc, STACK_BASE, vblk.m_jmp.stack, STACK_SIZE);
 
@@ -445,6 +499,12 @@ bool emu_t::legit_branch(vm::instrs::vblk_t& vblk, std::uintptr_t branch_addr) {
 
   m_sreg_cnt = 0u;
   uc_emu_start(uc, rip, 0ull, 0ull, 0ull);
+
+  // -- restore original cpu and stack...
+  uc_mem_write(uc, STACK_BASE, stack, STACK_SIZE);
+  uc_context_restore(uc, backup);
+  uc_context_free(backup);
+  delete stack;
 
   // add normal execution callback back...
   uc_hook_add(uc, &code_exec_hook, UC_HOOK_CODE,
