@@ -26,6 +26,11 @@ class emu_t {
   zydis_reg_t vip, vsp;
 
   /// <summary>
+  /// used in branch_pred_spec_exec to count legit SREG virtual instructions...
+  /// </summary>
+  std::uint8_t m_sreg_cnt;
+
+  /// <summary>
   /// current code trace...
   /// </summary>
   vm::instrs::hndlr_trace_t cc_trace;
@@ -44,7 +49,7 @@ class emu_t {
   /// <summary>
   /// unicorn engine hook
   /// </summary>
-  uc_hook code_exec_hook, invalid_mem_hook, int_hook;
+  uc_hook code_exec_hook, invalid_mem_hook, int_hook, branch_pred_hook;
 
   /// <summary>
   /// code execution callback for executable memory ranges of the vmprotect'ed
@@ -60,6 +65,21 @@ class emu_t {
                                  uint64_t address,
                                  uint32_t size,
                                  emu_t* obj);
+
+  /// <summary>
+  /// branch predicition with speculative execution (emulation)... this callback
+  /// ensures there are at least 10 SREG's and that all of the imm values are
+  /// legit...
+  /// </summary>
+  /// <param name="uc"></param>
+  /// <param name="address"></param>
+  /// <param name="size"></param>
+  /// <param name="obj"></param>
+  /// <returns></returns>
+  static bool branch_pred_spec_exec(uc_engine* uc,
+                                    uint64_t address,
+                                    uint32_t size,
+                                    emu_t* obj);
 
   /// <summary>
   /// invalid memory access handler. no runtime values can possibly effect the
@@ -89,21 +109,21 @@ class emu_t {
   static void int_callback(uc_engine* uc, std::uint32_t intno, emu_t* obj);
 
   /// <summary>
-  /// determines if its possible that the virtual instruction stream contains a
-  /// virtual JCC...
-  ///
-  /// this simply checks to see if there are at least 3 LCONST that load 64bit
-  /// constant values...
-  ///
-  /// it also checks if the last 2 LCONST's load image based addresses which
-  /// land inside of executable sections...
-  ///
-  /// this function cannot be used to determine if there is a virtual branch or
-  /// not... it is only a useful/preliminary function...
+  /// determines if there *could* be a JCC in the virtual code block... its not
+  /// 100%... speculative execution is required to ensure that both branches
+  /// discovered are legit...
   /// </summary>
-  /// <param name="vinstrs">vector of virtual instructions...</param>
-  /// <returns>returns true if there is at least 3 LCONST in the virtual
-  /// instruction stream that load 64bit values...</returns>
-  bool could_have_jcc(std::vector<vm::instrs::vinstr_t>& vinstrs);
+  /// <param name="vinstrs"></param>
+  /// <returns></returns>
+  std::optional<std::pair<std::uintptr_t, std::uintptr_t>> could_have_jcc(
+      std::vector<vm::instrs::vinstr_t>& vinstrs);
+
+  /// <summary>
+  /// determines if a branch is legit or not...
+  /// </summary>
+  /// <param name="vblk"></param>
+  /// <param name="branch_addr"></param>
+  /// <returns></returns>
+  bool legit_branch(vm::instrs::vblk_t& vblk, std::uintptr_t branch_addr);
 };
 }  // namespace vm

@@ -2,7 +2,10 @@
 
 namespace vm {
 emu_t::emu_t(vm::vmctx_t* vm_ctx)
-    : m_vm(vm_ctx), vip(vm_ctx->get_vip()), vsp(vm_ctx->get_vsp()) {}
+    : m_vm(vm_ctx),
+      vip(vm_ctx->get_vip()),
+      vsp(vm_ctx->get_vsp()),
+      m_sreg_cnt(0u) {}
 
 emu_t::~emu_t() {
   if (uc)
@@ -81,6 +84,7 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
 
   vm::instrs::vblk_t blk;
   blk.m_vip = {0ull, 0ull};
+  blk.m_vm = {vip, vsp};
 
   cc_blk = &blk;
   cc_vrtn = &vrtn;
@@ -91,9 +95,27 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
     return false;
   }
 
-  std::printf(
-      "> blk_%p, number of virtual instructions = %d, could have a jcc = %d\n",
-      blk.m_vip.img_base, blk.m_vinstrs.size(), could_have_jcc(blk.m_vinstrs));
+  auto res = could_have_jcc(blk.m_vinstrs);
+  std::printf("> blk_%p, number of virtual instructions = %d\n",
+              blk.m_vip.img_base, blk.m_vinstrs.size());
+
+  if (res.has_value()) {
+    const auto [b1, b2] = res.value();
+    auto b1_legit =
+        legit_branch(blk, (b1 - m_vm->m_image_base) + m_vm->m_module_base);
+    auto b2_legit =
+        legit_branch(blk, (b2 - m_vm->m_image_base) + m_vm->m_module_base);
+
+    if (b1_legit && b2_legit) {
+      blk.branches.push_back(b1);
+      blk.branches.push_back(b2);
+      blk.branch_type = vm::instrs::vbranch_type::jcc;
+      std::printf("> code block has jcc, b1 = %p, b2 = %p\n", b1, b2);
+    } else {
+      blk.branch_type = vm::instrs::vbranch_type::absolute;
+      std::printf("> code block has absolute jmp...\n");
+    }
+  }
   return true;
 }
 
@@ -128,10 +150,10 @@ void emu_t::int_callback(uc_engine* uc, std::uint32_t intno, emu_t* obj) {
   }
 }
 
-bool emu_t::code_exec_callback(uc_engine* uc,
-                               uint64_t address,
-                               uint32_t size,
-                               emu_t* obj) {
+bool emu_t::branch_pred_spec_exec(uc_engine* uc,
+                                  uint64_t address,
+                                  uint32_t size,
+                                  emu_t* obj) {
   uc_err err;
   static thread_local zydis_decoded_instr_t instr;
   if (!ZYAN_SUCCESS(ZydisDecoderDecodeBuffer(vm::utils::g_decoder.get(),
@@ -184,6 +206,92 @@ bool emu_t::code_exec_callback(uc_engine* uc,
       obj->cc_trace.m_instrs.erase((rva_fetch + 1).base(),
                                    obj->cc_trace.m_instrs.end());
 
+    const auto vinstr =
+        vm::instrs::determine(obj->vip, obj->vsp, obj->cc_trace);
+
+    // -- free the trace since we will start a new one...
+    std::for_each(obj->cc_trace.m_instrs.begin(), obj->cc_trace.m_instrs.end(),
+                  [&](const vm::instrs::emu_instr_t& instr) {
+                    uc_context_free(instr.m_cpu);
+                  });
+
+    free(obj->cc_trace.m_stack);
+    obj->cc_trace.m_instrs.clear();
+
+    if (vinstr.mnemonic != vm::instrs::mnemonic_t::jmp) {
+      if (vinstr.mnemonic != vm::instrs::mnemonic_t::sreg)
+        uc_emu_stop(uc);
+
+      if (!vinstr.imm.has_imm)
+        uc_emu_stop(uc);
+
+      if (vinstr.imm.size != 8 ||
+          vinstr.imm.val > std::numeric_limits<std::uint8_t>::max())
+        uc_emu_stop(uc);
+
+      // -- stop after 10 legit SREG's...
+      if (++obj->m_sreg_cnt == 10)
+        uc_emu_stop(uc);
+    }
+  }
+}
+
+bool emu_t::code_exec_callback(uc_engine* uc,
+                               uint64_t address,
+                               uint32_t size,
+                               emu_t* obj) {
+  uc_err err;
+  static thread_local zydis_decoded_instr_t instr;
+  if (!ZYAN_SUCCESS(ZydisDecoderDecodeBuffer(vm::utils::g_decoder.get(),
+                                             reinterpret_cast<void*>(address),
+                                             PAGE_4KB, &instr))) {
+    std::printf("> failed to decode instruction at = 0x%p\n", address);
+    if ((err = uc_emu_stop(uc))) {
+      std::printf("> failed to stop emulation, exiting... reason = %d\n", err);
+      exit(0);
+    }
+    return false;
+  }
+
+  if (instr.mnemonic == ZYDIS_MNEMONIC_INVALID)
+    return false;
+
+  uc_context* ctx;
+  uc_context_alloc(uc, &ctx);
+  uc_context_save(uc, ctx);
+
+  // if this is the first instruction of this handler then save the stack...
+  if (!obj->cc_trace.m_instrs.size()) {
+    obj->cc_trace.m_stack = new std::uint8_t[STACK_SIZE];
+    uc_mem_read(uc, STACK_BASE, obj->cc_trace.m_stack, STACK_SIZE);
+  }
+
+  obj->cc_trace.m_instrs.push_back({instr, ctx});
+
+  // RET or JMP REG means the end of a vm handler...
+  if (instr.mnemonic == ZYDIS_MNEMONIC_RET ||
+      (instr.mnemonic == ZYDIS_MNEMONIC_JMP &&
+       instr.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER)) {
+    // deobfuscate the instruction stream before profiling...
+    // makes it easier for profiles to be correct...
+    vm::instrs::deobfuscate(obj->cc_trace);
+
+    // find the last MOV REG, DWORD PTR [VIP] in the instruction stream, then
+    // remove any instructions from this instruction to the JMP/RET...
+    const auto rva_fetch = std::find_if(
+        obj->cc_trace.m_instrs.rbegin(), obj->cc_trace.m_instrs.rend(),
+        [&vip = obj->vip](const vm::instrs::emu_instr_t& instr) -> bool {
+          const auto& i = instr.m_instr;
+          return i.mnemonic == ZYDIS_MNEMONIC_MOV &&
+                 i.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                 i.operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                 i.operands[1].mem.base == vip && i.operands[1].size == 32;
+        });
+
+    if (rva_fetch != obj->cc_trace.m_instrs.rend())
+      obj->cc_trace.m_instrs.erase((rva_fetch + 1).base(),
+                                   obj->cc_trace.m_instrs.end());
+
     // set the virtual code block vip address information...
     if (!obj->cc_blk->m_vip.rva || !obj->cc_blk->m_vip.img_base) {
       auto vip_write = std::find_if(
@@ -197,7 +305,7 @@ bool emu_t::code_exec_callback(uc_engine* uc,
       uc_context* backup;
       uc_context_alloc(uc, &backup);
       uc_context_save(uc, backup);
-      uc_context_restore(uc, (vip_write - 1)->m_cpu);
+      uc_context_restore(uc, vip_write->m_cpu);
 
       auto uc_reg =
           vm::instrs::reg_map[vip_write->m_instr.operands[0].reg.value];
@@ -257,7 +365,8 @@ bool emu_t::code_exec_callback(uc_engine* uc,
         // set current code block virtual jmp instruction information...
         obj->cc_blk->m_jmp.ctx = copy;
         obj->cc_blk->m_jmp.stack = new std::uint8_t[STACK_SIZE];
-        uc_mem_read(uc, STACK_BASE, obj->cc_blk->m_jmp.stack, STACK_SIZE);
+        std::memcpy(obj->cc_blk->m_jmp.stack, obj->cc_trace.m_stack,
+                    STACK_SIZE);
       }
 
       if (vinstr.mnemonic == vm::instrs::mnemonic_t::jmp ||
@@ -316,7 +425,40 @@ void emu_t::invalid_mem(uc_engine* uc,
   }
 }
 
-bool emu_t::could_have_jcc(std::vector<vm::instrs::vinstr_t>& vinstrs) {
+bool emu_t::legit_branch(vm::instrs::vblk_t& vblk, std::uintptr_t branch_addr) {
+  // remove normal execution callback...
+  uc_hook_del(uc, code_exec_hook);
+
+  // add branch pred hook...
+  uc_hook_add(uc, &branch_pred_hook, UC_HOOK_CODE,
+              (void*)&vm::emu_t::branch_pred_spec_exec, this,
+              m_vm->m_module_base, m_vm->m_module_base + m_vm->m_image_size);
+
+  // restore cpu and stack...
+  uc_context_restore(uc, vblk.m_jmp.ctx);
+  uc_mem_write(uc, STACK_BASE, vblk.m_jmp.stack, STACK_SIZE);
+
+  std::uintptr_t vsp_ptr = 0ull, rip = 0ull;
+  uc_reg_read(uc, UC_X86_REG_RIP, &rip);
+  uc_reg_read(uc, vm::instrs::reg_map[vblk.m_vm.vsp], &vsp_ptr);
+  uc_mem_write(uc, vsp_ptr, &branch_addr, sizeof branch_addr);
+
+  m_sreg_cnt = 0u;
+  uc_emu_start(uc, rip, 0ull, 0ull, 0ull);
+
+  // add normal execution callback back...
+  uc_hook_add(uc, &code_exec_hook, UC_HOOK_CODE,
+              (void*)&vm::emu_t::code_exec_callback, this, m_vm->m_module_base,
+              m_vm->m_module_base + m_vm->m_image_size);
+
+  return m_sreg_cnt == 10;
+}
+
+std::optional<std::pair<std::uintptr_t, std::uintptr_t>> emu_t::could_have_jcc(
+    std::vector<vm::instrs::vinstr_t>& vinstrs) {
+  if (vinstrs.back().mnemonic == vm::instrs::mnemonic_t::vmexit)
+    return {};
+
   // check to see if there is at least 3 LCONST %i64's
   if (std::accumulate(
           vinstrs.begin(), vinstrs.end(), 0u,
@@ -326,7 +468,7 @@ bool emu_t::could_have_jcc(std::vector<vm::instrs::vinstr_t>& vinstrs) {
                        ? ++val
                        : val;
           }) < 3)
-    return false;
+    return {};
 
   // extract the lconst64's out of the virtual instruction stream...
   static const auto lconst64_chk = [&](vm::instrs::vinstr_t& v) -> bool {
@@ -337,19 +479,19 @@ bool emu_t::could_have_jcc(std::vector<vm::instrs::vinstr_t>& vinstrs) {
       std::find_if(vinstrs.rbegin(), vinstrs.rend(), lconst64_chk);
 
   if (lconst1 == vinstrs.rend())
-    return false;
+    return {};
 
   const auto lconst2 = std::find_if(lconst1 + 1, vinstrs.rend(), lconst64_chk);
 
   if (lconst2 == vinstrs.rend())
-    return false;
+    return {};
 
   // check to see if the imm val is inside of the image...
   if (lconst1->imm.val > m_vm->m_image_base + m_vm->m_image_size ||
       lconst1->imm.val < m_vm->m_image_base ||
       lconst2->imm.val > m_vm->m_image_base + m_vm->m_image_size ||
       lconst2->imm.val < m_vm->m_image_base)
-    return false;
+    return {};
 
   // check to see if the imm's points to something inside of an executable
   // section...
@@ -359,8 +501,8 @@ bool emu_t::could_have_jcc(std::vector<vm::instrs::vinstr_t>& vinstrs) {
       !vm::utils::scn::executable(
           m_vm->m_module_base,
           (lconst2->imm.val - m_vm->m_image_base) + m_vm->m_module_base))
-    return false;
+    return {};
 
-  return true;
+  return {{lconst1->imm.val, lconst2->imm.val}};
 }
 }  // namespace vm
