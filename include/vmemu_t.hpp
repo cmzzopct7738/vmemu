@@ -23,7 +23,6 @@ class emu_t {
  private:
   uc_engine* uc;
   const vm::vmctx_t* m_vm;
-  zydis_reg_t vip, vsp;
 
   /// <summary>
   /// used in branch_pred_spec_exec to count legit SREG virtual instructions...
@@ -125,11 +124,5 @@ class emu_t {
   /// <param name="branch_addr"></param>
   /// <returns></returns>
   bool legit_branch(vm::instrs::vblk_t& vblk, std::uintptr_t branch_addr);
-
-  void emulate_branch(uc_context* ctx,
-                      std::uint8_t* stack,
-                      std::uintptr_t branch_addr,
-                      zydis_reg_t vsp,
-                      vm::instrs::vblk_t& vblk);
 };
 }  // namespace vm

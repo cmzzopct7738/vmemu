@@ -1,11 +1,7 @@
 #include <vmemu_t.hpp>
 
 namespace vm {
-emu_t::emu_t(vm::vmctx_t* vm_ctx)
-    : m_vm(vm_ctx),
-      vip(vm_ctx->get_vip()),
-      vsp(vm_ctx->get_vsp()),
-      m_sreg_cnt(0u) {}
+emu_t::emu_t(vm::vmctx_t* vm_ctx) : m_vm(vm_ctx) {}
 
 emu_t::~emu_t() {
   if (uc)
@@ -64,6 +60,16 @@ bool emu_t::init() {
 
 bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
   uc_err err;
+  vrtn.m_rva = vmenter_rva;
+
+  auto& blk = vrtn.m_blks.emplace_back();
+  blk.m_vip = {0ull, 0ull};
+  blk.m_vm = {m_vm->get_vip(), m_vm->get_vsp()};
+
+  cc_blk = &blk;
+  cc_vrtn = &vrtn;
+  cc_trace.m_uc = uc;
+
   std::uintptr_t rip = vmenter_rva + m_vm->m_module_base,
                  rsp = STACK_BASE + STACK_SIZE - PAGE_4KB;
 
@@ -77,17 +83,8 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
     return false;
   }
 
-  cc_trace.m_uc = uc;
-  cc_trace.m_vip = vip;
-  cc_trace.m_vsp = vsp;
-  vrtn.m_rva = vmenter_rva;
-
-  vm::instrs::vblk_t blk;
-  blk.m_vip = {0ull, 0ull};
-  blk.m_vm = {vip, vsp};
-
-  cc_blk = &blk;
-  cc_vrtn = &vrtn;
+  cc_trace.m_vip = cc_blk->m_vm.vip;
+  cc_trace.m_vsp = cc_blk->m_vm.vsp;
 
   std::printf("> beginning execution at = %p\n", rip);
   if ((err = uc_emu_start(uc, rip, 0ull, 0ull, 0ull))) {
@@ -95,73 +92,67 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
     return false;
   }
 
-  auto res = could_have_jcc(blk.m_vinstrs);
-  std::printf("> blk_%p, number of virtual instructions = %d\n",
-              blk.m_vip.img_base, blk.m_vinstrs.size());
+  auto br_info = could_have_jcc(cc_blk->m_vinstrs);
+  if (br_info.has_value()) {
+    auto [br1, br2] = br_info.value();
 
-  if (res.has_value()) {
-    const auto [b1, b2] = res.value();
-    auto b1_legit =
-        legit_branch(blk, (b1 - m_vm->m_image_base) + m_vm->m_module_base);
-    auto b2_legit =
-        legit_branch(blk, (b2 - m_vm->m_image_base) + m_vm->m_module_base);
+    // convert to absolute addresses...
+    br1 -= m_vm->m_image_base;
+    br2 -= m_vm->m_image_base;
+    br1 += m_vm->m_module_base;
+    br2 += m_vm->m_module_base;
 
-    if (b1_legit && b2_legit) {
-      blk.branches.push_back(b1);
-      blk.branches.push_back(b2);
-      blk.branch_type = vm::instrs::vbranch_type::jcc;
-      std::printf("> code block has jcc, b1 = %p, b2 = %p\n", b1, b2);
-    } else {
-      uc_context* backup;
-      std::uint8_t* stack = new std::uint8_t[STACK_SIZE];
-      uc_mem_read(uc, STACK_BASE, stack, STACK_SIZE);
-      uc_context_alloc(uc, &backup);
-      uc_context_save(uc, backup);
+    auto br1_legit = legit_branch(*cc_blk, br1);
+    auto br2_legit = legit_branch(*cc_blk, br2);
+    std::printf("> br1 legit: %d, br2 legit: %d\n", br1_legit, br2_legit);
+  }
+
+  // keep track of the emulated blocks... by their addresses...
+  std::vector<std::uintptr_t> blk_addrs;
+  blk_addrs.push_back(blk.m_vip.img_base);
+
+  // the vector containing the vblk's grows inside of this for loop
+  // thus we cannot use an advanced for loop (which uses itr's)...
+  for (auto idx = 0u; idx < cc_vrtn->m_blks.size(); ++idx) {
+    auto& blk = cc_vrtn->m_blks[idx];
+    if (blk.branch_type != vm::instrs::vbranch_type::none) {
+      std::uintptr_t rip = 0ull, vsp = 0ull;
       uc_context_restore(uc, blk.m_jmp.ctx);
+      uc_mem_write(uc, STACK_BASE, blk.m_jmp.stack, STACK_SIZE);
+      uc_reg_read(uc, vm::instrs::reg_map[blk.m_vm.vsp], &vsp);
+      uc_reg_read(uc, UC_X86_REG_RIP, &rip);
 
-      std::uintptr_t vsp_ptr = 0ull, branch_addr = 0ull;
-      uc_reg_read(uc, vm::instrs::reg_map[blk.m_vm.vsp], &vsp_ptr);
-      uc_mem_read(uc, vsp_ptr, &branch_addr, sizeof branch_addr);
+      // force the emulation of all branches...
+      for (const auto br : blk.branches) {
+        // only emulate blocks that havent been emulated before...
+        if (std::find(blk_addrs.begin(), blk_addrs.end(), br) !=
+            blk_addrs.end())
+          continue;
 
-      uc_context_restore(uc, backup);
-      uc_context_free(backup);
-      uc_mem_write(uc, STACK_BASE, stack, STACK_SIZE);
-      delete stack;
+        // setup new cc_blk...
+        auto& new_blk = vrtn.m_blks.emplace_back();
+        new_blk.m_vip = {0ull, 0ull};
+        new_blk.m_vm = {blk.m_jmp.m_vm.vip, blk.m_jmp.m_vm.vsp};
+        cc_blk = &new_blk;
 
-      blk.branches.push_back(branch_addr);
-      blk.branch_type = vm::instrs::vbranch_type::absolute;
-      std::printf("> code block has absolute jmp, b1 = %p\n", branch_addr);
+        // emulate the branch...
+        uc_mem_write(uc, vsp, &br, sizeof br);
+        uc_emu_start(uc, rip, 0ull, 0ull, 0ull);
+      }
     }
   }
+
+  // free all virtual code block virtual jmp information...
+  std::for_each(vrtn.m_blks.begin(), vrtn.m_blks.end(),
+                [&](vm::instrs::vblk_t& blk) {
+                  if (blk.m_jmp.ctx)
+                    uc_context_free(blk.m_jmp.ctx);
+
+                  if (blk.m_jmp.stack)
+                    delete[] blk.m_jmp.stack;
+                });
+
   return true;
-}
-
-void emu_t::emulate_branch(uc_context* ctx,
-                           std::uint8_t* stack,
-                           std::uintptr_t branch_addr,
-                           zydis_reg_t vsp,
-                           vm::instrs::vblk_t& vblk) {
-  uc_context* backup;
-  std::uint8_t* stack_backup = new std::uint8_t[STACK_SIZE];
-  std::uintptr_t vsp_addr = 0ull, rip = 0ull;
-
-  uc_context_alloc(uc, &backup);
-  uc_context_save(uc, backup);
-  uc_mem_read(uc, STACK_BASE, stack_backup, STACK_SIZE);
-
-  uc_context_restore(uc, ctx);
-  uc_mem_write(uc, STACK_BASE, stack, STACK_SIZE);
-  uc_reg_read(uc, vm::instrs::reg_map[vsp], &vsp_addr);
-  uc_reg_read(uc, UC_X86_REG_RIP, &rip);
-  uc_mem_write(uc, vsp_addr, &branch_addr, sizeof branch_addr);
-
-  cc_blk = &vblk;
-  uc_emu_start(uc, rip, 0u, 0u, 0u);
-
-  uc_mem_write(uc, STACK_BASE, stack_backup, STACK_SIZE);
-  uc_context_restore(uc, backup);
-  uc_context_free(backup);
-  delete stack_backup;
 }
 
 void emu_t::int_callback(uc_engine* uc, std::uint32_t intno, emu_t* obj) {
@@ -221,7 +212,7 @@ bool emu_t::branch_pred_spec_exec(uc_engine* uc,
 
   // if this is the first instruction of this handler then save the stack...
   if (!obj->cc_trace.m_instrs.size()) {
-    obj->cc_trace.m_stack = reinterpret_cast<std::uint8_t*>(malloc(STACK_SIZE));
+    obj->cc_trace.m_stack = new std::uint8_t[STACK_SIZE];
     uc_mem_read(uc, STACK_BASE, obj->cc_trace.m_stack, STACK_SIZE);
   }
 
@@ -239,7 +230,8 @@ bool emu_t::branch_pred_spec_exec(uc_engine* uc,
     // remove any instructions from this instruction to the JMP/RET...
     const auto rva_fetch = std::find_if(
         obj->cc_trace.m_instrs.rbegin(), obj->cc_trace.m_instrs.rend(),
-        [&vip = obj->vip](const vm::instrs::emu_instr_t& instr) -> bool {
+        [&vip = obj->cc_trace.m_vip](
+            const vm::instrs::emu_instr_t& instr) -> bool {
           const auto& i = instr.m_instr;
           return i.mnemonic == ZYDIS_MNEMONIC_MOV &&
                  i.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
@@ -251,8 +243,7 @@ bool emu_t::branch_pred_spec_exec(uc_engine* uc,
       obj->cc_trace.m_instrs.erase((rva_fetch + 1).base(),
                                    obj->cc_trace.m_instrs.end());
 
-    const auto vinstr =
-        vm::instrs::determine(obj->vip, obj->vsp, obj->cc_trace);
+    const auto vinstr = vm::instrs::determine(obj->cc_trace);
 
     // -- free the trace since we will start a new one...
     std::for_each(obj->cc_trace.m_instrs.begin(), obj->cc_trace.m_instrs.end(),
@@ -260,7 +251,7 @@ bool emu_t::branch_pred_spec_exec(uc_engine* uc,
                     uc_context_free(instr.m_cpu);
                   });
 
-    free(obj->cc_trace.m_stack);
+    delete[] obj->cc_trace.m_stack;
     obj->cc_trace.m_instrs.clear();
 
     if (vinstr.mnemonic != vm::instrs::mnemonic_t::jmp) {
@@ -270,8 +261,7 @@ bool emu_t::branch_pred_spec_exec(uc_engine* uc,
       if (!vinstr.imm.has_imm)
         uc_emu_stop(uc);
 
-      if (vinstr.imm.size != 8 ||
-          vinstr.imm.val > std::numeric_limits<std::uint8_t>::max())
+      if (vinstr.imm.size != 8 || vinstr.imm.val > 8 * VIRTUAL_REGISTER_COUNT)
         uc_emu_stop(uc);
 
       // -- stop after 10 legit SREG's...
@@ -279,6 +269,7 @@ bool emu_t::branch_pred_spec_exec(uc_engine* uc,
         uc_emu_stop(uc);
     }
   }
+  return true;
 }
 
 bool emu_t::code_exec_callback(uc_engine* uc,
@@ -325,7 +316,8 @@ bool emu_t::code_exec_callback(uc_engine* uc,
     // remove any instructions from this instruction to the JMP/RET...
     const auto rva_fetch = std::find_if(
         obj->cc_trace.m_instrs.rbegin(), obj->cc_trace.m_instrs.rend(),
-        [&vip = obj->vip](const vm::instrs::emu_instr_t& instr) -> bool {
+        [&vip = obj->cc_trace.m_vip](
+            const vm::instrs::emu_instr_t& instr) -> bool {
           const auto& i = instr.m_instr;
           return i.mnemonic == ZYDIS_MNEMONIC_MOV &&
                  i.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
@@ -339,9 +331,10 @@ bool emu_t::code_exec_callback(uc_engine* uc,
 
     // set the virtual code block vip address information...
     if (!obj->cc_blk->m_vip.rva || !obj->cc_blk->m_vip.img_base) {
+      // find the last write done to VIP...
       auto vip_write = std::find_if(
           obj->cc_trace.m_instrs.rbegin(), obj->cc_trace.m_instrs.rend(),
-          [&vip = obj->vip](vm::instrs::emu_instr_t& instr) -> bool {
+          [&vip = obj->cc_trace.m_vip](vm::instrs::emu_instr_t& instr) -> bool {
             const auto& i = instr.m_instr;
             return i.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
                    i.operands[0].reg.value == vip;
@@ -364,9 +357,7 @@ bool emu_t::code_exec_callback(uc_engine* uc,
       uc_context_restore(uc, backup);
       uc_context_free(backup);
     } else {
-      const auto vinstr =
-          vm::instrs::determine(obj->vip, obj->vsp, obj->cc_trace);
-
+      const auto vinstr = vm::instrs::determine(obj->cc_trace);
       if (vinstr.mnemonic != vm::instrs::mnemonic_t::unknown) {
         if (vinstr.imm.has_imm)
           std::printf("> %s %p\n",
@@ -383,8 +374,9 @@ bool emu_t::code_exec_callback(uc_engine* uc,
                         inst_stream.push_back({instr.m_instr});
                       });
 
+        std::printf("> err: please define the following vm handler:\n");
         vm::utils::print(inst_stream);
-        std::getchar();
+        return false;
       }
 
       if (obj->cc_blk->m_vinstrs.size()) {
@@ -407,6 +399,7 @@ bool emu_t::code_exec_callback(uc_engine* uc,
           // set current code block virtual jmp instruction information...
           obj->cc_blk->m_jmp.ctx = copy;
           obj->cc_blk->m_jmp.stack = new std::uint8_t[STACK_SIZE];
+          obj->cc_blk->m_jmp.m_vm = {obj->cc_trace.m_vip, obj->cc_trace.m_vsp};
           std::memcpy(obj->cc_blk->m_jmp.stack, obj->cc_trace.m_stack,
                       STACK_SIZE);
         }
@@ -416,8 +409,6 @@ bool emu_t::code_exec_callback(uc_engine* uc,
           uc_emu_stop(obj->uc);
       }
 
-      obj->cc_trace.m_vip = obj->vip;
-      obj->cc_trace.m_vsp = obj->vsp;
       obj->cc_blk->m_vinstrs.push_back(vinstr);
     }
 
@@ -427,7 +418,7 @@ bool emu_t::code_exec_callback(uc_engine* uc,
                     uc_context_free(instr.m_cpu);
                   });
 
-    free(obj->cc_trace.m_stack);
+    delete[] obj->cc_trace.m_stack;
     obj->cc_trace.m_instrs.clear();
   }
   return true;
@@ -481,7 +472,7 @@ bool emu_t::legit_branch(vm::instrs::vblk_t& vblk, std::uintptr_t branch_addr) {
               (void*)&vm::emu_t::branch_pred_spec_exec, this,
               m_vm->m_module_base, m_vm->m_module_base + m_vm->m_image_size);
 
-  // -- make a backup of the current emulation state...
+  // make a backup of the current emulation state...
   uc_context* backup;
   uc_context_alloc(uc, &backup);
   uc_context_save(uc, backup);
@@ -492,25 +483,28 @@ bool emu_t::legit_branch(vm::instrs::vblk_t& vblk, std::uintptr_t branch_addr) {
   uc_context_restore(uc, vblk.m_jmp.ctx);
   uc_mem_write(uc, STACK_BASE, vblk.m_jmp.stack, STACK_SIZE);
 
-  std::uintptr_t vsp_ptr = 0ull, rip = 0ull;
+  // force the virtual machine to try and emulate the branch address...
+  std::uintptr_t vsp = 0ull, rip = 0ull;
   uc_reg_read(uc, UC_X86_REG_RIP, &rip);
-  uc_reg_read(uc, vm::instrs::reg_map[vblk.m_vm.vsp], &vsp_ptr);
-  uc_mem_write(uc, vsp_ptr, &branch_addr, sizeof branch_addr);
+  uc_reg_read(uc, vm::instrs::reg_map[vblk.m_vm.vsp], &vsp);
+  uc_mem_write(uc, vsp, &branch_addr, sizeof branch_addr);
 
   m_sreg_cnt = 0u;
   uc_emu_start(uc, rip, 0ull, 0ull, 0ull);
 
-  // -- restore original cpu and stack...
+  // restore original cpu and stack...
   uc_mem_write(uc, STACK_BASE, stack, STACK_SIZE);
   uc_context_restore(uc, backup);
   uc_context_free(backup);
-  delete stack;
+  delete[] stack;
 
   // add normal execution callback back...
   uc_hook_add(uc, &code_exec_hook, UC_HOOK_CODE,
               (void*)&vm::emu_t::code_exec_callback, this, m_vm->m_module_base,
               m_vm->m_module_base + m_vm->m_image_size);
 
+  // we will consider this a legit branch if there is at least 10
+  // SREG instructions...
   return m_sreg_cnt == 10;
 }
 
