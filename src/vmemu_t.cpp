@@ -491,13 +491,21 @@ void emu_t::invalid_mem(uc_engine* uc,
   switch (type) {
     case UC_MEM_READ_UNMAPPED: {
       uc_mem_map(uc, address & ~0xFFFull, PAGE_4KB, UC_PROT_ALL);
+      std::printf(">>> reading invalid memory at address = %p, size = 0x%x\n",
+                  address, size);
       break;
     }
     case UC_MEM_WRITE_UNMAPPED: {
       uc_mem_map(uc, address & ~0xFFFull, PAGE_4KB, UC_PROT_ALL);
+      std::printf(
+          ">>> writing invalid memory at address = %p, size = 0x%x, val = "
+          "0x%x\n",
+          address, size, value);
       break;
     }
     case UC_MEM_FETCH_UNMAPPED: {
+      std::printf(">>> fetching invalid instructions at address = %p\n",
+                  address);
       break;
     }
     default:
