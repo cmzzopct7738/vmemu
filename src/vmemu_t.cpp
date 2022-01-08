@@ -105,22 +105,39 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
     auto br1_legit = legit_branch(*cc_blk, br1);
     auto br2_legit = legit_branch(*cc_blk, br2);
     std::printf("> br1 legit: %d, br2 legit: %d\n", br1_legit, br2_legit);
+
+    if (br1_legit && br2_legit) {
+      std::printf("> virtual jcc uncovered... br1 = %p, br2 = %p\n", br1, br2);
+      cc_blk->branch_type = vm::instrs::vbranch_type::jcc;
+      cc_blk->branches.push_back(br1);
+      cc_blk->branches.push_back(br2);
+    } else if (br1_legit || br2_legit) {
+      std::printf("> absolute virtual jmp uncovered... branch = %p\n",
+                  br1_legit ? br1 : br2);
+      cc_blk->branch_type = vm::instrs::vbranch_type::absolute;
+      cc_blk->branches.push_back(br1_legit ? br1 : br2);
+    } else {
+      std::printf("> unknown branch type...\n");
+      return false;
+    }
+  } else if (cc_blk->m_vinstrs.back().mnemonic ==
+             vm::instrs::mnemonic_t::vmexit) {
+    cc_blk->branch_type = vm::instrs::vbranch_type::none;
   }
 
   // keep track of the emulated blocks... by their addresses...
   std::vector<std::uintptr_t> blk_addrs;
-  blk_addrs.push_back(blk.m_vip.img_base);
+  blk_addrs.push_back(blk.m_vip.rva + m_vm->m_module_base);
 
   // the vector containing the vblk's grows inside of this for loop
   // thus we cannot use an advanced for loop (which uses itr's)...
   for (auto idx = 0u; idx < cc_vrtn->m_blks.size(); ++idx) {
-    auto& blk = cc_vrtn->m_blks[idx];
+    vm::instrs::vblk_t blk = cc_vrtn->m_blks[idx];
     if (blk.branch_type != vm::instrs::vbranch_type::none) {
-      std::uintptr_t rip = 0ull, vsp = 0ull;
+      std::uintptr_t vsp = 0ull;
       uc_context_restore(uc, blk.m_jmp.ctx);
       uc_mem_write(uc, STACK_BASE, blk.m_jmp.stack, STACK_SIZE);
       uc_reg_read(uc, vm::instrs::reg_map[blk.m_vm.vsp], &vsp);
-      uc_reg_read(uc, UC_X86_REG_RIP, &rip);
 
       // force the emulation of all branches...
       for (const auto br : blk.branches) {
@@ -137,7 +154,41 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
 
         // emulate the branch...
         uc_mem_write(uc, vsp, &br, sizeof br);
-        uc_emu_start(uc, rip, 0ull, 0ull, 0ull);
+        uc_emu_start(uc, blk.m_jmp.rip, 0ull, 0ull, 0ull);
+
+        auto br_info = could_have_jcc(cc_blk->m_vinstrs);
+        if (br_info.has_value()) {
+          auto [br1, br2] = br_info.value();
+
+          // convert to absolute addresses...
+          br1 -= m_vm->m_image_base;
+          br2 -= m_vm->m_image_base;
+          br1 += m_vm->m_module_base;
+          br2 += m_vm->m_module_base;
+
+          auto br1_legit = legit_branch(*cc_blk, br1);
+          auto br2_legit = legit_branch(*cc_blk, br2);
+          std::printf("> br1 legit: %d, br2 legit: %d\n", br1_legit, br2_legit);
+
+          if (br1_legit && br2_legit) {
+            std::printf("> virtual jcc uncovered... br1 = %p, br2 = %p\n", br1,
+                        br2);
+            cc_blk->branch_type = vm::instrs::vbranch_type::jcc;
+            cc_blk->branches.push_back(br1);
+            cc_blk->branches.push_back(br2);
+          } else if (br1_legit || br2_legit) {
+            std::printf("> absolute virtual jmp uncovered... branch = %p\n",
+                        br1_legit ? br1 : br2);
+            cc_blk->branch_type = vm::instrs::vbranch_type::absolute;
+            cc_blk->branches.push_back(br1_legit ? br1 : br2);
+          } else {
+            std::printf("> unknown branch type...\n");
+            return false;
+          }
+        } else if (cc_blk->m_vinstrs.back().mnemonic ==
+                   vm::instrs::mnemonic_t::vmexit) {
+          cc_blk->branch_type = vm::instrs::vbranch_type::none;
+        }
       }
     }
   }
@@ -299,6 +350,7 @@ bool emu_t::code_exec_callback(uc_engine* uc,
   // if this is the first instruction of this handler then save the stack...
   if (!obj->cc_trace.m_instrs.size()) {
     obj->cc_trace.m_stack = new std::uint8_t[STACK_SIZE];
+    obj->cc_trace.m_begin = address;
     uc_mem_read(uc, STACK_BASE, obj->cc_trace.m_stack, STACK_SIZE);
   }
 
@@ -374,8 +426,13 @@ bool emu_t::code_exec_callback(uc_engine* uc,
                         inst_stream.push_back({instr.m_instr});
                       });
 
-        std::printf("> err: please define the following vm handler:\n");
+        std::printf(
+            "> err: please define the following vm handler (at = %p):\n",
+            (obj->cc_trace.m_begin - obj->m_vm->m_module_base) +
+                obj->m_vm->m_image_base);
+
         vm::utils::print(inst_stream);
+        uc_emu_stop(uc);
         return false;
       }
 
@@ -398,6 +455,7 @@ bool emu_t::code_exec_callback(uc_engine* uc,
 
           // set current code block virtual jmp instruction information...
           obj->cc_blk->m_jmp.ctx = copy;
+          obj->cc_blk->m_jmp.rip = obj->cc_trace.m_begin;
           obj->cc_blk->m_jmp.stack = new std::uint8_t[STACK_SIZE];
           obj->cc_blk->m_jmp.m_vm = {obj->cc_trace.m_vip, obj->cc_trace.m_vsp};
           std::memcpy(obj->cc_blk->m_jmp.stack, obj->cc_trace.m_stack,
@@ -433,29 +491,13 @@ void emu_t::invalid_mem(uc_engine* uc,
   switch (type) {
     case UC_MEM_READ_UNMAPPED: {
       uc_mem_map(uc, address & ~0xFFFull, PAGE_4KB, UC_PROT_ALL);
-      std::printf(">>> reading invalid memory at address = %p, size = 0x%x\n",
-                  address, size);
       break;
     }
     case UC_MEM_WRITE_UNMAPPED: {
       uc_mem_map(uc, address & ~0xFFFull, PAGE_4KB, UC_PROT_ALL);
-      std::printf(
-          ">>> writing invalid memory at address = %p, size = 0x%x, val = "
-          "0x%x\n",
-          address, size, value);
       break;
     }
     case UC_MEM_FETCH_UNMAPPED: {
-      std::printf(">>> fetching invalid instructions at address = %p\n",
-                  address);
-
-      std::uintptr_t rip, rsp;
-      uc_reg_read(uc, UC_X86_REG_RSP, &rsp);
-      uc_mem_read(uc, rsp, &rip, sizeof rip);
-      rsp += 8;
-      uc_reg_write(uc, UC_X86_REG_RSP, &rsp);
-      uc_reg_write(uc, UC_X86_REG_RIP, &rip);
-      std::printf(">>> injecting return to try and recover... rip = %p\n", rip);
       break;
     }
     default:
@@ -499,6 +541,7 @@ bool emu_t::legit_branch(vm::instrs::vblk_t& vblk, std::uintptr_t branch_addr) {
   delete[] stack;
 
   // add normal execution callback back...
+  uc_hook_del(uc, branch_pred_hook);
   uc_hook_add(uc, &code_exec_hook, UC_HOOK_CODE,
               (void*)&vm::emu_t::code_exec_callback, this, m_vm->m_module_base,
               m_vm->m_module_base + m_vm->m_image_size);
