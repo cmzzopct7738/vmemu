@@ -92,10 +92,67 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
     return false;
   }
 
+  extract_branch_data();
+  std::printf("> emulated blk_%p\n\n", cc_blk->m_vip.img_base);
+
+  // keep track of the emulated blocks... by their addresses...
+  std::vector<std::uintptr_t> blk_addrs;
+  blk_addrs.push_back(blk.m_vip.rva + m_vm->m_module_base);
+
+  // the vector containing the vblk's grows inside of this for loop
+  // thus we cannot use an advanced for loop (which uses itr's)...
+  for (auto idx = 0u; idx < cc_vrtn->m_blks.size(); ++idx) {
+    vm::instrs::vblk_t blk = cc_vrtn->m_blks[idx];
+    if (blk.branch_type != vm::instrs::vbranch_type::none) {
+      // force the emulation of all branches...
+      for (const auto br : blk.branches) {
+        // only emulate blocks that havent been emulated before...
+        if (std::find(blk_addrs.begin(), blk_addrs.end(), br) !=
+            blk_addrs.end())
+          continue;
+
+        std::uintptr_t vsp = 0ull;
+        uc_context_restore(uc, blk.m_jmp.ctx);
+        uc_mem_write(uc, STACK_BASE, blk.m_jmp.stack, STACK_SIZE);
+        uc_reg_read(uc, vm::instrs::reg_map[blk.m_vm.vsp], &vsp);
+
+        // setup new cc_blk...
+        auto& new_blk = vrtn.m_blks.emplace_back();
+        new_blk.m_vip = {0ull, 0ull};
+        new_blk.m_vm = {blk.m_jmp.m_vm.vip, blk.m_jmp.m_vm.vsp};
+        cc_blk = &new_blk;
+
+        // emulate the branch...
+        uc_mem_write(uc, vsp, &br, sizeof br);
+        std::printf("> beginning execution at = %p\n", blk.m_jmp.rip);
+        if ((err = uc_emu_start(uc, blk.m_jmp.rip, 0ull, 0ull, 0ull))) {
+          std::printf("> error starting emu... reason = %d\n", err);
+          return false;
+        }
+
+        extract_branch_data();
+        std::printf("> emulated blk_%p\n", cc_blk->m_vip.img_base);
+      }
+    }
+  }
+
+  // free all virtual code block virtual jmp information...
+  std::for_each(vrtn.m_blks.begin(), vrtn.m_blks.end(),
+                [&](vm::instrs::vblk_t& blk) {
+                  if (blk.m_jmp.ctx)
+                    uc_context_free(blk.m_jmp.ctx);
+
+                  if (blk.m_jmp.stack)
+                    delete[] blk.m_jmp.stack;
+                });
+
+  return true;
+}
+
+void emu_t::extract_branch_data() {
   auto br_info = could_have_jcc(cc_blk->m_vinstrs);
   if (br_info.has_value()) {
     auto [br1, br2] = br_info.value();
-
     // convert to absolute addresses...
     br1 -= m_vm->m_image_base;
     br2 -= m_vm->m_image_base;
@@ -118,92 +175,37 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
       cc_blk->branches.push_back(br1_legit ? br1 : br2);
     } else {
       std::printf("> unknown branch type...\n");
-      return false;
     }
   } else if (cc_blk->m_vinstrs.back().mnemonic ==
              vm::instrs::mnemonic_t::vmexit) {
     cc_blk->branch_type = vm::instrs::vbranch_type::none;
-  }
+  } else if (cc_blk->m_vinstrs.back().mnemonic == vm::instrs::mnemonic_t::jmp) {
+    // see if there is 1 lconst...
+    if (auto last_lconst = std::find_if(
+            cc_blk->m_vinstrs.rbegin(), cc_blk->m_vinstrs.rend(),
+            [&](vm::instrs::vinstr_t& vinstr) -> bool {
+              return vinstr.mnemonic == vm::instrs::mnemonic_t::lconst &&
+                     vinstr.imm.size == 64;
+            });
+        last_lconst != cc_blk->m_vinstrs.rend()) {
+      const auto imm_img_based = last_lconst->imm.val;
+      const auto imm_mod_based =
+          (imm_img_based - m_vm->m_image_base) + m_vm->m_module_base;
 
-  // keep track of the emulated blocks... by their addresses...
-  std::vector<std::uintptr_t> blk_addrs;
-  blk_addrs.push_back(blk.m_vip.rva + m_vm->m_module_base);
-
-  // the vector containing the vblk's grows inside of this for loop
-  // thus we cannot use an advanced for loop (which uses itr's)...
-  for (auto idx = 0u; idx < cc_vrtn->m_blks.size(); ++idx) {
-    vm::instrs::vblk_t blk = cc_vrtn->m_blks[idx];
-    if (blk.branch_type != vm::instrs::vbranch_type::none) {
-      std::uintptr_t vsp = 0ull;
-      uc_context_restore(uc, blk.m_jmp.ctx);
-      uc_mem_write(uc, STACK_BASE, blk.m_jmp.stack, STACK_SIZE);
-      uc_reg_read(uc, vm::instrs::reg_map[blk.m_vm.vsp], &vsp);
-
-      // force the emulation of all branches...
-      for (const auto br : blk.branches) {
-        // only emulate blocks that havent been emulated before...
-        if (std::find(blk_addrs.begin(), blk_addrs.end(), br) !=
-            blk_addrs.end())
-          continue;
-
-        // setup new cc_blk...
-        auto& new_blk = vrtn.m_blks.emplace_back();
-        new_blk.m_vip = {0ull, 0ull};
-        new_blk.m_vm = {blk.m_jmp.m_vm.vip, blk.m_jmp.m_vm.vsp};
-        cc_blk = &new_blk;
-
-        // emulate the branch...
-        uc_mem_write(uc, vsp, &br, sizeof br);
-        uc_emu_start(uc, blk.m_jmp.rip, 0ull, 0ull, 0ull);
-
-        auto br_info = could_have_jcc(cc_blk->m_vinstrs);
-        if (br_info.has_value()) {
-          auto [br1, br2] = br_info.value();
-
-          // convert to absolute addresses...
-          br1 -= m_vm->m_image_base;
-          br2 -= m_vm->m_image_base;
-          br1 += m_vm->m_module_base;
-          br2 += m_vm->m_module_base;
-
-          auto br1_legit = legit_branch(*cc_blk, br1);
-          auto br2_legit = legit_branch(*cc_blk, br2);
-          std::printf("> br1 legit: %d, br2 legit: %d\n", br1_legit, br2_legit);
-
-          if (br1_legit && br2_legit) {
-            std::printf("> virtual jcc uncovered... br1 = %p, br2 = %p\n", br1,
-                        br2);
-            cc_blk->branch_type = vm::instrs::vbranch_type::jcc;
-            cc_blk->branches.push_back(br1);
-            cc_blk->branches.push_back(br2);
-          } else if (br1_legit || br2_legit) {
-            std::printf("> absolute virtual jmp uncovered... branch = %p\n",
-                        br1_legit ? br1 : br2);
-            cc_blk->branch_type = vm::instrs::vbranch_type::absolute;
-            cc_blk->branches.push_back(br1_legit ? br1 : br2);
-          } else {
-            std::printf("> unknown branch type...\n");
-            return false;
-          }
-        } else if (cc_blk->m_vinstrs.back().mnemonic ==
-                   vm::instrs::mnemonic_t::vmexit) {
-          cc_blk->branch_type = vm::instrs::vbranch_type::none;
-        }
+      // check to see if the imm is inside of the module... and if the ptr lands
+      // inside of an executable section... then lastly check to see if its a
+      // legit branch or not...
+      if (imm_img_based >= m_vm->m_image_base &&
+          imm_img_based < m_vm->m_image_base + m_vm->m_image_size &&
+          vm::utils::scn::executable(m_vm->m_module_base, imm_mod_based)) {
+        cc_blk->branches.push_back(imm_mod_based);
+        cc_blk->branch_type = vm::instrs::vbranch_type::absolute;
       }
+    } else {
+      std::printf("> jump table detected... review instruction stream...\n");
+      uc_emu_stop(uc);
     }
   }
-
-  // free all virtual code block virtual jmp information...
-  std::for_each(vrtn.m_blks.begin(), vrtn.m_blks.end(),
-                [&](vm::instrs::vblk_t& blk) {
-                  if (blk.m_jmp.ctx)
-                    uc_context_free(blk.m_jmp.ctx);
-
-                  if (blk.m_jmp.stack)
-                    delete[] blk.m_jmp.stack;
-                });
-
-  return true;
 }
 
 void emu_t::int_callback(uc_engine* uc, std::uint32_t intno, emu_t* obj) {
@@ -395,13 +397,10 @@ bool emu_t::code_exec_callback(uc_engine* uc,
       uc_context* backup;
       uc_context_alloc(uc, &backup);
       uc_context_save(uc, backup);
-      uc_context_restore(uc, vip_write->m_cpu);
-
-      auto uc_reg =
-          vm::instrs::reg_map[vip_write->m_instr.operands[0].reg.value];
+      uc_context_restore(uc, (--vip_write)->m_cpu);
 
       std::uintptr_t vip_addr = 0ull;
-      uc_reg_read(uc, uc_reg, &vip_addr);
+      uc_reg_read(uc, vm::instrs::reg_map[obj->cc_trace.m_vip], &vip_addr);
 
       obj->cc_blk->m_vip.rva = vip_addr -= obj->m_vm->m_module_base;
       obj->cc_blk->m_vip.img_base = vip_addr += obj->m_vm->m_image_base;

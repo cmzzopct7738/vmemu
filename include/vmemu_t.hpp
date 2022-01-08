@@ -124,5 +124,10 @@ class emu_t {
   /// <param name="branch_addr"></param>
   /// <returns></returns>
   bool legit_branch(vm::instrs::vblk_t& vblk, std::uintptr_t branch_addr);
+
+  /// <summary>
+  /// extracts the current code blocks branch data...
+  /// </summary>
+  void extract_branch_data();
 };
 }  // namespace vm
