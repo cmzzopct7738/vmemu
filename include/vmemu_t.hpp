@@ -1,8 +1,9 @@
 #pragma once
 #include <unicorn/unicorn.h>
+
 #include <atomic>
 #include <functional>
-#include <nt/image.hpp>
+#include <linuxpe>
 #include <numeric>
 #include <string>
 #include <vmctx.hpp>
@@ -60,9 +61,7 @@ class emu_t {
   /// <param name="size"></param>
   /// <param name="obj"></param>
   /// <returns></returns>
-  static bool code_exec_callback(uc_engine* uc,
-                                 uint64_t address,
-                                 uint32_t size,
+  static bool code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
                                  emu_t* obj);
 
   /// <summary>
@@ -75,10 +74,8 @@ class emu_t {
   /// <param name="size"></param>
   /// <param name="obj"></param>
   /// <returns></returns>
-  static bool branch_pred_spec_exec(uc_engine* uc,
-                                    uint64_t address,
-                                    uint32_t size,
-                                    emu_t* obj);
+  static bool branch_pred_spec_exec(uc_engine* uc, uint64_t address,
+                                    uint32_t size, emu_t* obj);
 
   /// <summary>
   /// invalid memory access handler. no runtime values can possibly effect the
@@ -91,12 +88,8 @@ class emu_t {
   /// <param name="size">size of the memory access...</param>
   /// <param name="value">value being read...</param>
   /// <param name="obj">emu_t object pointer...</param>
-  static void invalid_mem(uc_engine* uc,
-                          uc_mem_type type,
-                          uint64_t address,
-                          int size,
-                          int64_t value,
-                          emu_t* obj);
+  static void invalid_mem(uc_engine* uc, uc_mem_type type, uint64_t address,
+                          int size, int64_t value, emu_t* obj);
 
   /// <summary>
   /// interrupt callback for unicorn engine. this is used to advance rip over
