@@ -6,6 +6,7 @@ name = "vmemu"
 
 [target.vmemu]
 type = "static"
+compile-features = ["cxx_std_20"]
 
 sources = [
     "src/**.cpp",

@@ -71,6 +71,10 @@ target_compile_definitions(vmemu PUBLIC
 	NOMINMAX
 )
 
+target_compile_features(vmemu PUBLIC
+	cxx_std_20
+)
+
 target_include_directories(vmemu PUBLIC
 	include
 )
