@@ -370,7 +370,7 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
         });
 
     if (rva_fetch != obj->cc_trace.m_instrs.rend())
-      obj->cc_trace.m_instrs.erase((rva_fetch + 1).base(),
+      obj->cc_trace.m_instrs.erase(rva_fetch.base(),
                                    obj->cc_trace.m_instrs.end());
 
     // set the virtual code block vip address information...
@@ -394,7 +394,7 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
       uc_reg_read(uc, vm::instrs::reg_map[obj->cc_trace.m_vip], &vip_addr);
 
       obj->cc_blk->m_vip.rva = vip_addr -= obj->m_vm->m_module_base;
-      obj->cc_blk->m_vip.img_based = vip_addr += obj->m_vm->m_image_base;
+      obj->cc_blk->m_vip.img_based = obj->cc_blk->m_vip.rva += obj->m_vm->m_image_base;
 
       uc_context_restore(uc, backup);
       uc_context_free(backup);
