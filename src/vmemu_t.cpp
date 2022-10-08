@@ -1,8 +1,9 @@
 #include <string>
 #include <vmemu_t.hpp>
-
 namespace vm {
-emu_t::emu_t(vm::vmctx_t* vm_ctx) : m_vm(vm_ctx) {}
+emu_t::emu_t(vm::vmctx_t* vm_ctx, bool log) : m_vm(vm_ctx),
+                                              log_bytecode(log) {}
+emu_t::emu_t(vm::vmctx_t* vm_ctx) : m_vm(vm_ctx) {};
 
 emu_t::~emu_t() {
   if (uc) uc_close(uc);
@@ -86,14 +87,14 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
   cc_trace.m_vip = cc_blk->m_vm.vip;
   cc_trace.m_vsp = cc_blk->m_vm.vsp;
 
-  std::printf("> beginning execution at = %p\n", rip);
+  std::printf("> beginning execution at = %p (%p)\n", rip, rip - m_vm->m_module_base + m_vm->m_image_base);
   if ((err = uc_emu_start(uc, rip, 0ull, 0ull, 0ull))) {
     std::printf("> error starting emu... reason = %d\n", err);
     return false;
   }
 
   extract_branch_data();
-  std::printf("> emulated blk_%p\n\n", cc_blk->m_vip.img_base);
+  std::printf("> emulated blk_%p\n\n", cc_blk->m_vip.img_based);
 
   // keep track of the emulated blocks... by their addresses...
   std::vector<std::uintptr_t> blk_addrs;
@@ -124,14 +125,14 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
 
         // emulate the branch...
         uc_mem_write(uc, vsp, &br, sizeof br);
-        std::printf("> beginning execution at = %p\n", blk.m_jmp.rip);
+        std::printf("> beginning execution at = %p (%p)\n", rip, rip - m_vm->m_module_base + m_vm->m_image_base);
         if ((err = uc_emu_start(uc, blk.m_jmp.rip, 0ull, 0ull, 0ull))) {
           std::printf("> error starting emu... reason = %d\n", err);
           return false;
         }
 
         extract_branch_data();
-        std::printf("> emulated blk_%p\n", cc_blk->m_vip.img_base);
+        std::printf("> emulated blk_%p\n", cc_blk->m_vip.img_based);
       }
     }
   }
@@ -148,62 +149,62 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
 }
 
 void emu_t::extract_branch_data() {
-  auto br_info = could_have_jcc(cc_blk->m_vinstrs);
-  if (br_info.has_value()) {
-    auto [br1, br2] = br_info.value();
-    // convert to absolute addresses...
-    br1 -= m_vm->m_image_base;
-    br2 -= m_vm->m_image_base;
-    br1 += m_vm->m_module_base;
-    br2 += m_vm->m_module_base;
+    auto br_info = could_have_jcc(cc_blk->m_vinstrs);
+    if (br_info.has_value()) {
+        auto [br1, br2] = br_info.value();
+        // convert to absolute addresses...
+        br1 -= m_vm->m_image_base;
+        br2 -= m_vm->m_image_base;
+        br1 += m_vm->m_module_base;
+        br2 += m_vm->m_module_base;
 
-    auto br1_legit = legit_branch(*cc_blk, br1);
-    auto br2_legit = legit_branch(*cc_blk, br2);
-    std::printf("> br1 legit: %d, br2 legit: %d\n", br1_legit, br2_legit);
+        auto br1_legit = legit_branch(*cc_blk, br1);
+        auto br2_legit = legit_branch(*cc_blk, br2);
+        std::printf("> br1 legit: %d, br2 legit: %d\n", br1_legit, br2_legit);
 
-    if (br1_legit && br2_legit) {
-      std::printf("> virtual jcc uncovered... br1 = %p, br2 = %p\n", br1, br2);
-      cc_blk->branch_type = vm::instrs::vbranch_type::jcc;
-      cc_blk->branches.push_back(br1);
-      cc_blk->branches.push_back(br2);
-    } else if (br1_legit || br2_legit) {
-      std::printf("> absolute virtual jmp uncovered... branch = %p\n",
-                  br1_legit ? br1 : br2);
-      cc_blk->branch_type = vm::instrs::vbranch_type::absolute;
-      cc_blk->branches.push_back(br1_legit ? br1 : br2);
-    } else {
-      std::printf("> unknown branch type...\n");
-    }
-  } else if (cc_blk->m_vinstrs.back().mnemonic ==
-             vm::instrs::mnemonic_t::vmexit) {
-    cc_blk->branch_type = vm::instrs::vbranch_type::none;
-  } else if (cc_blk->m_vinstrs.back().mnemonic == vm::instrs::mnemonic_t::jmp) {
-    // see if there is 1 lconst...
-    if (auto last_lconst = std::find_if(
-            cc_blk->m_vinstrs.rbegin(), cc_blk->m_vinstrs.rend(),
-            [&](vm::instrs::vinstr_t& vinstr) -> bool {
-              return vinstr.mnemonic == vm::instrs::mnemonic_t::lconst &&
-                     vinstr.imm.size == 64;
-            });
-        last_lconst != cc_blk->m_vinstrs.rend()) {
-      const auto imm_img_based = last_lconst->imm.val;
-      const auto imm_mod_based =
-          (imm_img_based - m_vm->m_image_base) + m_vm->m_module_base;
-
-      // check to see if the imm is inside of the module... and if the ptr lands
-      // inside of an executable section... then lastly check to see if its a
-      // legit branch or not...
-      if (imm_img_based >= m_vm->m_image_base &&
-          imm_img_based < m_vm->m_image_base + m_vm->m_image_size &&
-          vm::utils::scn::executable(m_vm->m_module_base, imm_mod_based)) {
-        cc_blk->branches.push_back(imm_mod_based);
+        if (br1_legit && br2_legit) {
+        std::printf("> virtual jcc uncovered... br1 = %p, br2 = %p\n", br1, br2);
+        cc_blk->branch_type = vm::instrs::vbranch_type::jcc;
+        cc_blk->branches.push_back(br1);
+        cc_blk->branches.push_back(br2);
+        } else if (br1_legit || br2_legit) {
+        std::printf("> absolute virtual jmp uncovered... branch = %p\n",
+                    br1_legit ? br1 : br2);
         cc_blk->branch_type = vm::instrs::vbranch_type::absolute;
-      }
-    } else {
-      std::printf("> jump table detected... review instruction stream...\n");
-      uc_emu_stop(uc);
+        cc_blk->branches.push_back(br1_legit ? br1 : br2);
+        } else {
+        std::printf("> unknown branch type...\n");
+        }
+    } else if (cc_blk->m_vinstrs.back().mnemonic ==
+                vm::instrs::mnemonic_t::vmexit) {
+        cc_blk->branch_type = vm::instrs::vbranch_type::none;
+    } else if (cc_blk->m_vinstrs.back().mnemonic == vm::instrs::mnemonic_t::jmp) {
+        // see if there is 1 lconst...
+        if (auto last_lconst = std::find_if(
+                cc_blk->m_vinstrs.rbegin(), cc_blk->m_vinstrs.rend(),
+                [&](vm::instrs::vinstr_t& vinstr) -> bool {
+                return vinstr.mnemonic == vm::instrs::mnemonic_t::lconst &&
+                        vinstr.imm.size == 64;
+                });
+            last_lconst != cc_blk->m_vinstrs.rend()) {
+        const auto imm_img_based = last_lconst->imm.val;
+        const auto imm_mod_based =
+            (imm_img_based - m_vm->m_image_base) + m_vm->m_module_base;
+
+        // check to see if the imm is inside of the module... and if the ptr lands
+        // inside of an executable section... then lastly check to see if its a
+        // legit branch or not...
+        if (imm_img_based >= m_vm->m_image_base &&
+            imm_img_based < m_vm->m_image_base + m_vm->m_image_size &&
+            vm::utils::scn::executable(m_vm->m_module_base, imm_mod_based)) {
+            cc_blk->branches.push_back(imm_mod_based);
+            cc_blk->branch_type = vm::instrs::vbranch_type::absolute;
+        }
+        } else {
+        std::printf("> jump table detected... review instruction stream...\n");
+        uc_emu_stop(uc);
+        }
     }
-  }
 }
 
 void emu_t::int_callback(uc_engine* uc, std::uint32_t intno, emu_t* obj) {
@@ -373,7 +374,7 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
                                    obj->cc_trace.m_instrs.end());
 
     // set the virtual code block vip address information...
-    if (!obj->cc_blk->m_vip.rva || !obj->cc_blk->m_vip.img_base) {
+    if (!obj->cc_blk->m_vip.rva || !obj->cc_blk->m_vip.img_based) {
       // find the last write done to VIP...
       auto vip_write = std::find_if(
           obj->cc_trace.m_instrs.rbegin(), obj->cc_trace.m_instrs.rend(),
@@ -393,17 +394,38 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
       uc_reg_read(uc, vm::instrs::reg_map[obj->cc_trace.m_vip], &vip_addr);
 
       obj->cc_blk->m_vip.rva = vip_addr -= obj->m_vm->m_module_base;
-      obj->cc_blk->m_vip.img_base = vip_addr += obj->m_vm->m_image_base;
+      obj->cc_blk->m_vip.img_based = vip_addr += obj->m_vm->m_image_base;
 
       uc_context_restore(uc, backup);
       uc_context_free(backup);
     } else {
       const auto vinstr = vm::instrs::determine(obj->cc_trace);
       if (vinstr.mnemonic != vm::instrs::mnemonic_t::unknown) {
+        if (obj->log_bytecode)
+        {
+          obj->il_bytecode.emplace_back(static_cast<uint8_t>(vinstr.mnemonic));
+          if (vinstr.imm.has_imm)
+          { 
+            obj->il_bytecode.emplace_back(vinstr.imm.size);
+            for(int i = 0; i < (vinstr.imm.size / 8); ++i)
+            {
+              obj->il_bytecode.emplace_back(*(reinterpret_cast<const uint8_t*>(&vinstr.imm.val) + i));
+            }
+          }
+          else
+            obj->il_bytecode.emplace_back<uint8_t>(0);
+        }
+        std::printf("%p: ", obj->cc_trace.m_begin + obj->m_vm->m_image_base - obj->m_vm->m_module_base);
         if (vinstr.imm.has_imm)
-          std::printf("> %s %p\n",
-                      vm::instrs::get_profile(vinstr.mnemonic)->name.c_str(),
-                      vinstr.imm.val);
+          if (vinstr.mnemonic == instrs::mnemonic_t::lreg || vinstr.mnemonic == instrs::mnemonic_t::sreg)
+            std::printf("> %s %s_%s\n",
+                        vm::instrs::get_profile(vinstr.mnemonic)->name.c_str(),
+                        vm::reg_names::prefixes[(vinstr.imm.val / 8) % 8].c_str(),
+                        vm::reg_names::suffixes[(vinstr.imm.val / 8) / 8].c_str());
+          else
+            std::printf("> %s %p\n",
+                        vm::instrs::get_profile(vinstr.mnemonic)->name.c_str(),
+                        vinstr.imm.val);
         else
           std::printf("> %s\n",
                       vm::instrs::get_profile(vinstr.mnemonic)->name.c_str());
@@ -592,4 +614,9 @@ std::optional<std::pair<std::uintptr_t, std::uintptr_t>> emu_t::could_have_jcc(
 
   return {{lconst1->imm.val, lconst2->imm.val}};
 }
+
+  std::vector<uint8_t>& emu_t::get_il_bytecode()
+  {
+    return il_bytecode;
+  }
 }  // namespace vm

@@ -1,6 +1,7 @@
 #pragma once
 #include <unicorn/unicorn.h>
 
+#include <array>
 #include <atomic>
 #include <functional>
 #include <linuxpe>
@@ -14,12 +15,19 @@
 #define STACK_BASE 0xFFFF000000000000
 
 namespace vm {
+namespace reg_names
+{
+  const std::array<std::string, 8> prefixes = {{"Red", "Blue", "Pink", "Green", "Orange", "Yellow", "Black", "White"}};
+  const std::array<std::string, 4> suffixes = {{"Crewmate", "Engineer", "Imposter", "Shapeshifter"}};
+}
 class emu_t {
  public:
+  explicit emu_t(vm::vmctx_t* vm_ctx, bool log);
   explicit emu_t(vm::vmctx_t* vm_ctx);
   ~emu_t();
   bool init();
   bool emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn);
+  std::vector<uint8_t>& get_il_bytecode();
 
  private:
   uc_engine* uc;
@@ -51,6 +59,11 @@ class emu_t {
   /// </summary>
   uc_hook code_exec_hook, invalid_mem_hook, int_hook, branch_pred_hook;
 
+  bool log_bytecode;
+
+  // Logged bytecode for lifting
+  std::vector<uint8_t> il_bytecode;
+
   /// <summary>
   /// code execution callback for executable memory ranges of the vmprotect'ed
   /// module... essentially used to single step the processor over virtual
@@ -61,7 +74,9 @@ class emu_t {
   /// <param name="size"></param>
   /// <param name="obj"></param>
   /// <returns></returns>
-  static bool code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
+  static bool code_exec_callback(uc_engine* uc,
+                                 uint64_t address,
+                                 uint32_t size,
                                  emu_t* obj);
 
   /// <summary>
@@ -74,8 +89,10 @@ class emu_t {
   /// <param name="size"></param>
   /// <param name="obj"></param>
   /// <returns></returns>
-  static bool branch_pred_spec_exec(uc_engine* uc, uint64_t address,
-                                    uint32_t size, emu_t* obj);
+  static bool branch_pred_spec_exec(uc_engine* uc,
+                                    uint64_t address,
+                                    uint32_t size,
+                                    emu_t* obj);
 
   /// <summary>
   /// invalid memory access handler. no runtime values can possibly effect the
@@ -88,8 +105,12 @@ class emu_t {
   /// <param name="size">size of the memory access...</param>
   /// <param name="value">value being read...</param>
   /// <param name="obj">emu_t object pointer...</param>
-  static void invalid_mem(uc_engine* uc, uc_mem_type type, uint64_t address,
-                          int size, int64_t value, emu_t* obj);
+  static void invalid_mem(uc_engine* uc,
+                          uc_mem_type type,
+                          uint64_t address,
+                          int size,
+                          int64_t value,
+                          emu_t* obj);
 
   /// <summary>
   /// interrupt callback for unicorn engine. this is used to advance rip over
