@@ -149,6 +149,11 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
 }
 
 void emu_t::extract_branch_data() {
+    if (cc_blk->m_vinstrs.empty())
+    {
+      cc_blk->branch_type = vm::instrs::vbranch_type::none;
+      return;
+    }
     auto br_info = could_have_jcc(cc_blk->m_vinstrs);
     if (br_info.has_value()) {
         auto [br1, br2] = br_info.value();
@@ -370,8 +375,8 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
         });
 
     if (rva_fetch != obj->cc_trace.m_instrs.rend())
-      obj->cc_trace.m_instrs.erase(rva_fetch.base(),
-                                   obj->cc_trace.m_instrs.end());
+      obj->cc_trace.m_instrs.erase((rva_fetch + 1).base(),
+                                   --obj->cc_trace.m_instrs.end());
 
     // set the virtual code block vip address information...
     if (!obj->cc_blk->m_vip.rva || !obj->cc_blk->m_vip.img_based) {
@@ -394,13 +399,13 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
       uc_reg_read(uc, vm::instrs::reg_map[obj->cc_trace.m_vip], &vip_addr);
 
       obj->cc_blk->m_vip.rva = vip_addr -= obj->m_vm->m_module_base;
-      obj->cc_blk->m_vip.img_based = obj->cc_blk->m_vip.rva += obj->m_vm->m_image_base;
+      obj->cc_blk->m_vip.img_based = vip_addr += obj->m_vm->m_image_base;
 
       uc_context_restore(uc, backup);
       uc_context_free(backup);
     } else {
       const auto vinstr = vm::instrs::determine(obj->cc_trace);
-      if (vinstr.mnemonic != vm::instrs::mnemonic_t::unknown) {
+      if (vinstr.mnemonic != vm::instrs::mnemonic_t::unknown) { //TODO: Remove and add this after the code block is made
         if (obj->log_bytecode)
         {
           obj->il_bytecode.emplace_back(static_cast<uint8_t>(vinstr.mnemonic));
