@@ -1,8 +1,6 @@
 #include <string>
 #include <vmemu_t.hpp>
 namespace vm {
-emu_t::emu_t(vm::vmctx_t* vm_ctx, bool log) : m_vm(vm_ctx),
-                                              log_bytecode(log) {}
 emu_t::emu_t(vm::vmctx_t* vm_ctx) : m_vm(vm_ctx) {};
 
 emu_t::~emu_t() {
@@ -405,21 +403,7 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
       uc_context_free(backup);
     } else {
       const auto vinstr = vm::instrs::determine(obj->cc_trace);
-      if (vinstr.mnemonic != vm::instrs::mnemonic_t::unknown) { //TODO: Remove and add this after the code block is made
-        if (obj->log_bytecode)
-        {
-          obj->il_bytecode.emplace_back(static_cast<uint8_t>(vinstr.mnemonic));
-          if (vinstr.imm.has_imm)
-          { 
-            obj->il_bytecode.emplace_back(vinstr.imm.size);
-            for(int i = 0; i < (vinstr.imm.size / 8); ++i)
-            {
-              obj->il_bytecode.emplace_back(*(reinterpret_cast<const uint8_t*>(&vinstr.imm.val) + i));
-            }
-          }
-          else
-            obj->il_bytecode.emplace_back<uint8_t>(0);
-        }
+      if (vinstr.mnemonic != vm::instrs::mnemonic_t::unknown) {
         std::printf("%p: ", obj->cc_trace.m_begin + obj->m_vm->m_image_base - obj->m_vm->m_module_base);
         if (vinstr.imm.has_imm)
           if (vinstr.mnemonic == instrs::mnemonic_t::lreg || vinstr.mnemonic == instrs::mnemonic_t::sreg)
@@ -446,7 +430,8 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
             "> err: please define the following vm handler (at = %p):\n",
             (obj->cc_trace.m_begin - obj->m_vm->m_module_base) +
                 obj->m_vm->m_image_base);
-
+        std::printf("vsp: %s, vip: %s\n", ZydisRegisterGetString(obj->cc_blk->m_vm.vsp),
+                                          ZydisRegisterGetString(obj->cc_blk->m_vm.vip));
         vm::utils::print(inst_stream);
         uc_emu_stop(uc);
         return false;
@@ -619,9 +604,4 @@ std::optional<std::pair<std::uintptr_t, std::uintptr_t>> emu_t::could_have_jcc(
 
   return {{lconst1->imm.val, lconst2->imm.val}};
 }
-
-  std::vector<uint8_t>& emu_t::get_il_bytecode()
-  {
-    return il_bytecode;
-  }
 }  // namespace vm

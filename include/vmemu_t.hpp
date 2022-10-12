@@ -22,7 +22,6 @@ namespace reg_names
 }
 class emu_t {
  public:
-  explicit emu_t(vm::vmctx_t* vm_ctx, bool log);
   explicit emu_t(vm::vmctx_t* vm_ctx);
   ~emu_t();
   bool init();
@@ -58,11 +57,6 @@ class emu_t {
   /// unicorn engine hook
   /// </summary>
   uc_hook code_exec_hook, invalid_mem_hook, int_hook, branch_pred_hook;
-
-  bool log_bytecode;
-
-  // Logged bytecode for lifting
-  std::vector<uint8_t> il_bytecode;
 
   /// <summary>
   /// code execution callback for executable memory ranges of the vmprotect'ed
