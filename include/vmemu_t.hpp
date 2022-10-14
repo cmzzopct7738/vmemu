@@ -26,7 +26,6 @@ class emu_t {
   ~emu_t();
   bool init();
   bool emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn);
-  std::vector<uint8_t>& get_il_bytecode();
 
  private:
   uc_engine* uc;

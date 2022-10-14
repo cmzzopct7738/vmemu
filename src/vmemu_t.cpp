@@ -82,9 +82,6 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
     return false;
   }
 
-  cc_trace.m_vip = cc_blk->m_vm.vip;
-  cc_trace.m_vsp = cc_blk->m_vm.vsp;
-
   std::printf("> beginning execution at = %p (%p)\n", rip, rip - m_vm->m_module_base + m_vm->m_image_base);
   if ((err = uc_emu_start(uc, rip, 0ull, 0ull, 0ull))) {
     std::printf("> error starting emu... reason = %d\n", err);
@@ -123,7 +120,8 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
 
         // emulate the branch...
         uc_mem_write(uc, vsp, &br, sizeof br);
-        std::printf("> beginning execution at = %p (%p)\n", rip, rip - m_vm->m_module_base + m_vm->m_image_base);
+        std::printf("> beginning execution at = %p (%p)\n", blk.m_jmp.rip, 
+                      blk.m_jmp.rip - m_vm->m_module_base + m_vm->m_image_base);
         if ((err = uc_emu_start(uc, blk.m_jmp.rip, 0ull, 0ull, 0ull))) {
           std::printf("> error starting emu... reason = %d\n", err);
           return false;
@@ -138,7 +136,7 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
   // free all virtual code block virtual jmp information...
   std::for_each(vrtn.m_blks.begin(), vrtn.m_blks.end(),
                 [&](vm::instrs::vblk_t& blk) {
-                  if (blk.m_jmp.ctx) uc_context_free(blk.m_jmp.ctx);
+                  if (blk.m_jmp.ctx) uct_context_free(blk.m_jmp.ctx);
 
                   if (blk.m_jmp.stack) delete[] blk.m_jmp.stack;
                 });
@@ -259,11 +257,13 @@ bool emu_t::branch_pred_spec_exec(uc_engine* uc, uint64_t address,
   if (instr.mnemonic == ZYDIS_MNEMONIC_INVALID) return false;
 
   uc_context* ctx;
-  uc_context_alloc(uc, &ctx);
+  uct_context_alloc(uc, &ctx);
   uc_context_save(uc, ctx);
 
   // if this is the first instruction of this handler then save the stack...
   if (!obj->cc_trace.m_instrs.size()) {
+    obj->cc_trace.m_vip = obj->cc_blk->m_vm.vip;
+    obj->cc_trace.m_vsp = obj->cc_blk->m_vm.vsp;
     obj->cc_trace.m_stack = new std::uint8_t[STACK_SIZE];
     uc_mem_read(uc, STACK_BASE, obj->cc_trace.m_stack, STACK_SIZE);
   }
@@ -292,15 +292,21 @@ bool emu_t::branch_pred_spec_exec(uc_engine* uc, uint64_t address,
         });
 
     if (rva_fetch != obj->cc_trace.m_instrs.rend())
+    {
+      for (auto itr = (rva_fetch + 1).base(); itr < obj->cc_trace.m_instrs.end(); itr++)
+      {
+        uct_context_free(itr->m_cpu);
+      }
       obj->cc_trace.m_instrs.erase((rva_fetch + 1).base(),
                                    obj->cc_trace.m_instrs.end());
+    }
 
     const auto vinstr = vm::instrs::determine(obj->cc_trace);
 
     // -- free the trace since we will start a new one...
     std::for_each(obj->cc_trace.m_instrs.begin(), obj->cc_trace.m_instrs.end(),
                   [&](const vm::instrs::emu_instr_t& instr) {
-                    uc_context_free(instr.m_cpu);
+                    uct_context_free(instr.m_cpu);
                   });
 
     delete[] obj->cc_trace.m_stack;
@@ -339,11 +345,13 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
   if (instr.mnemonic == ZYDIS_MNEMONIC_INVALID) return false;
 
   uc_context* ctx;
-  uc_context_alloc(uc, &ctx);
+  uct_context_alloc(uc, &ctx);
   uc_context_save(uc, ctx);
 
   // if this is the first instruction of this handler then save the stack...
   if (!obj->cc_trace.m_instrs.size()) {
+    obj->cc_trace.m_vip = obj->cc_blk->m_vm.vip;
+    obj->cc_trace.m_vsp = obj->cc_blk->m_vm.vsp;
     obj->cc_trace.m_stack = new std::uint8_t[STACK_SIZE];
     obj->cc_trace.m_begin = address;
     uc_mem_read(uc, STACK_BASE, obj->cc_trace.m_stack, STACK_SIZE);
@@ -373,8 +381,14 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
         });
 
     if (rva_fetch != obj->cc_trace.m_instrs.rend())
+    {
+      for (auto itr = (rva_fetch + 1).base(); itr < --obj->cc_trace.m_instrs.end(); ++itr)
+      {
+        uct_context_free(itr->m_cpu);
+      }
       obj->cc_trace.m_instrs.erase((rva_fetch + 1).base(),
                                    --obj->cc_trace.m_instrs.end());
+    }
 
     // set the virtual code block vip address information...
     if (!obj->cc_blk->m_vip.rva || !obj->cc_blk->m_vip.img_based) {
@@ -389,10 +403,10 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
           });
 
       uc_context* backup;
-      uc_context_alloc(uc, &backup);
+      uct_context_alloc(uc, &backup);
       uc_context_save(uc, backup);
       uc_context_restore(uc, (--vip_write)->m_cpu);
-
+      
       std::uintptr_t vip_addr = 0ull;
       uc_reg_read(uc, vm::instrs::reg_map[obj->cc_trace.m_vip], &vip_addr);
 
@@ -400,7 +414,7 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
       obj->cc_blk->m_vip.img_based = vip_addr += obj->m_vm->m_image_base;
 
       uc_context_restore(uc, backup);
-      uc_context_free(backup);
+      uct_context_free(backup);
     } else {
       const auto vinstr = vm::instrs::determine(obj->cc_trace);
       if (vinstr.mnemonic != vm::instrs::mnemonic_t::unknown) {
@@ -430,8 +444,8 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
             "> err: please define the following vm handler (at = %p):\n",
             (obj->cc_trace.m_begin - obj->m_vm->m_module_base) +
                 obj->m_vm->m_image_base);
-        std::printf("vsp: %s, vip: %s\n", ZydisRegisterGetString(obj->cc_blk->m_vm.vsp),
-                                          ZydisRegisterGetString(obj->cc_blk->m_vm.vip));
+        std::printf("vsp: %s, vip: %s\n", ZydisRegisterGetString(obj->cc_trace.m_vsp),
+                                          ZydisRegisterGetString(obj->cc_trace.m_vip));
         vm::utils::print(inst_stream);
         uc_emu_stop(uc);
         return false;
@@ -442,8 +456,8 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
           uc_context *backup, *copy;
 
           // backup current unicorn-engine context...
-          uc_context_alloc(uc, &backup);
-          uc_context_alloc(uc, &copy);
+          uct_context_alloc(uc, &backup);
+          uct_context_alloc(uc, &copy);
           uc_context_save(uc, backup);
 
           // make a copy of the first cpu context of the jmp handler...
@@ -452,7 +466,7 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
 
           // restore the unicorn-engine context... also free the backup...
           uc_context_restore(uc, backup);
-          uc_context_free(backup);
+          uct_context_free(backup);
 
           // set current code block virtual jmp instruction information...
           obj->cc_blk->m_jmp.ctx = copy;
@@ -474,7 +488,7 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
     // -- free the trace since we will start a new one...
     std::for_each(obj->cc_trace.m_instrs.begin(), obj->cc_trace.m_instrs.end(),
                   [&](const vm::instrs::emu_instr_t& instr) {
-                    uc_context_free(instr.m_cpu);
+                    uct_context_free(instr.m_cpu);
                   });
 
     delete[] obj->cc_trace.m_stack;
@@ -521,7 +535,7 @@ bool emu_t::legit_branch(vm::instrs::vblk_t& vblk, std::uintptr_t branch_addr) {
 
   // make a backup of the current emulation state...
   uc_context* backup;
-  uc_context_alloc(uc, &backup);
+  uct_context_alloc(uc, &backup);
   uc_context_save(uc, backup);
   std::uint8_t* stack = new std::uint8_t[STACK_SIZE];
   uc_mem_read(uc, STACK_BASE, stack, STACK_SIZE);
@@ -542,7 +556,7 @@ bool emu_t::legit_branch(vm::instrs::vblk_t& vblk, std::uintptr_t branch_addr) {
   // restore original cpu and stack...
   uc_mem_write(uc, STACK_BASE, stack, STACK_SIZE);
   uc_context_restore(uc, backup);
-  uc_context_free(backup);
+  uct_context_free(backup);
   delete[] stack;
 
   // add normal execution callback back...
