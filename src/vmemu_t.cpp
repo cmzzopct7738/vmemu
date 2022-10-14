@@ -1,5 +1,8 @@
 #include <string>
 #include <vmemu_t.hpp>
+#include <unordered_set>
+
+int g_new_delete_tracker;
 namespace vm {
 emu_t::emu_t(vm::vmctx_t* vm_ctx) : m_vm(vm_ctx) {};
 
@@ -58,6 +61,8 @@ bool emu_t::init() {
 }
 
 bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
+  std::printf("\nSTARTING FROM NEW VMENTER AT %p (%p)\n\n", vmenter_rva + m_vm->m_module_base,
+                                                              vmenter_rva + m_vm->m_image_base);
   uc_err err;
   vrtn.m_rva = vmenter_rva;
 
@@ -83,6 +88,8 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
   }
 
   std::printf("> beginning execution at = %p (%p)\n", rip, rip - m_vm->m_module_base + m_vm->m_image_base);
+  std::printf("vsp: %s, vip: %s\n", ZydisRegisterGetString(cc_blk->m_vm.vsp),
+                                    ZydisRegisterGetString(cc_blk->m_vm.vip));
   if ((err = uc_emu_start(uc, rip, 0ull, 0ull, 0ull))) {
     std::printf("> error starting emu... reason = %d\n", err);
     return false;
@@ -92,8 +99,8 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
   std::printf("> emulated blk_%p\n\n", cc_blk->m_vip.img_based);
 
   // keep track of the emulated blocks... by their addresses...
-  std::vector<std::uintptr_t> blk_addrs;
-  blk_addrs.push_back(blk.m_vip.rva + m_vm->m_module_base);
+  std::unordered_set<std::uintptr_t> blk_addrs;
+  blk_addrs.insert(blk.m_vip.rva + m_vm->m_module_base);
 
   // the vector containing the vblk's grows inside of this for loop
   // thus we cannot use an advanced for loop (which uses itr's)...
@@ -103,8 +110,7 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
       // force the emulation of all branches...
       for (const auto br : blk.branches) {
         // only emulate blocks that havent been emulated before...
-        if (std::find(blk_addrs.begin(), blk_addrs.end(), br) !=
-            blk_addrs.end())
+        if (blk_addrs.find(br) != blk_addrs.end())
           continue;
 
         std::uintptr_t vsp = 0ull;
@@ -119,9 +125,12 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
         cc_blk = &new_blk;
 
         // emulate the branch...
+        // The stack is now set up with vsp pointing to the next branch to execute, therefore the jmp will go to that branch.
         uc_mem_write(uc, vsp, &br, sizeof br);
         std::printf("> beginning execution at = %p (%p)\n", blk.m_jmp.rip, 
                       blk.m_jmp.rip - m_vm->m_module_base + m_vm->m_image_base);
+        std::printf("vsp: %s, vip: %s\n", ZydisRegisterGetString(cc_blk->m_vm.vsp),
+                                    ZydisRegisterGetString(cc_blk->m_vm.vip));
         if ((err = uc_emu_start(uc, blk.m_jmp.rip, 0ull, 0ull, 0ull))) {
           std::printf("> error starting emu... reason = %d\n", err);
           return false;
@@ -129,6 +138,8 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
 
         extract_branch_data();
         std::printf("> emulated blk_%p\n", cc_blk->m_vip.img_based);
+        // We needn't execute a block more than once for a single vrtn.
+        blk_addrs.insert(br);
       }
     }
   }
@@ -138,7 +149,7 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
                 [&](vm::instrs::vblk_t& blk) {
                   if (blk.m_jmp.ctx) uct_context_free(blk.m_jmp.ctx);
 
-                  if (blk.m_jmp.stack) delete[] blk.m_jmp.stack;
+                  if (blk.m_jmp.stack) delete[] blk.m_jmp.stack; if (blk.m_jmp.stack) g_new_delete_tracker--;
                 });
 
   return true;
@@ -200,6 +211,7 @@ void emu_t::extract_branch_data() {
             vm::utils::scn::executable(m_vm->m_module_base, imm_mod_based)) {
             cc_blk->branches.push_back(imm_mod_based);
             cc_blk->branch_type = vm::instrs::vbranch_type::absolute;
+            std::printf("> absolute virtual jmp uncovered... branch = %p\n", imm_mod_based);
         }
         } else {
         std::printf("> jump table detected... review instruction stream...\n");
@@ -264,7 +276,7 @@ bool emu_t::branch_pred_spec_exec(uc_engine* uc, uint64_t address,
   if (!obj->cc_trace.m_instrs.size()) {
     obj->cc_trace.m_vip = obj->cc_blk->m_vm.vip;
     obj->cc_trace.m_vsp = obj->cc_blk->m_vm.vsp;
-    obj->cc_trace.m_stack = new std::uint8_t[STACK_SIZE];
+    obj->cc_trace.m_stack = new std::uint8_t[STACK_SIZE]; g_new_delete_tracker++;
     uc_mem_read(uc, STACK_BASE, obj->cc_trace.m_stack, STACK_SIZE);
   }
 
@@ -309,7 +321,7 @@ bool emu_t::branch_pred_spec_exec(uc_engine* uc, uint64_t address,
                     uct_context_free(instr.m_cpu);
                   });
 
-    delete[] obj->cc_trace.m_stack;
+    delete[] obj->cc_trace.m_stack; if (obj->cc_trace.m_stack) g_new_delete_tracker--;
     obj->cc_trace.m_instrs.clear();
 
     if (vinstr.mnemonic != vm::instrs::mnemonic_t::jmp) {
@@ -352,7 +364,7 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
   if (!obj->cc_trace.m_instrs.size()) {
     obj->cc_trace.m_vip = obj->cc_blk->m_vm.vip;
     obj->cc_trace.m_vsp = obj->cc_blk->m_vm.vsp;
-    obj->cc_trace.m_stack = new std::uint8_t[STACK_SIZE];
+    obj->cc_trace.m_stack = new std::uint8_t[STACK_SIZE]; g_new_delete_tracker++;
     obj->cc_trace.m_begin = address;
     uc_mem_read(uc, STACK_BASE, obj->cc_trace.m_stack, STACK_SIZE);
   }
@@ -369,7 +381,9 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
 
     // find the last MOV REG, DWORD PTR [VIP] in the instruction stream, then
     // remove any instructions from this instruction to the JMP/RET...
-    const auto rva_fetch = std::find_if(
+    // This may be more performant and elegant, but it fucks my new jmp profiler. 
+    // I will keep it in as a comment for now in case I can make a jmp profiler compatible with this.
+/*     const auto rva_fetch = std::find_if(
         obj->cc_trace.m_instrs.rbegin(), obj->cc_trace.m_instrs.rend(),
         [& vip = obj->cc_trace.m_vip](
             const vm::instrs::emu_instr_t& instr) -> bool {
@@ -388,7 +402,7 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
       }
       obj->cc_trace.m_instrs.erase((rva_fetch + 1).base(),
                                    --obj->cc_trace.m_instrs.end());
-    }
+    } */
 
     // set the virtual code block vip address information...
     if (!obj->cc_blk->m_vip.rva || !obj->cc_blk->m_vip.img_based) {
@@ -418,20 +432,22 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
     } else {
       const auto vinstr = vm::instrs::determine(obj->cc_trace);
       if (vinstr.mnemonic != vm::instrs::mnemonic_t::unknown) {
-        std::printf("%p: ", obj->cc_trace.m_begin + obj->m_vm->m_image_base - obj->m_vm->m_module_base);
-        if (vinstr.imm.has_imm)
-          if (vinstr.mnemonic == instrs::mnemonic_t::lreg || vinstr.mnemonic == instrs::mnemonic_t::sreg)
-            std::printf("> %s %s_%s\n",
-                        vm::instrs::get_profile(vinstr.mnemonic)->name.c_str(),
-                        vm::reg_names::prefixes[(vinstr.imm.val / 8) % 8].c_str(),
-                        vm::reg_names::suffixes[(vinstr.imm.val / 8) / 8].c_str());
+        if (s_log_instructions) {
+          std::printf("%p: ", obj->cc_trace.m_begin + obj->m_vm->m_image_base - obj->m_vm->m_module_base);
+          if (vinstr.imm.has_imm)
+            if (vinstr.mnemonic == instrs::mnemonic_t::lreg || vinstr.mnemonic == instrs::mnemonic_t::sreg)
+              std::printf("> %s %s_%s\n",
+                          vm::instrs::get_profile(vinstr.mnemonic)->name.c_str(),
+                          vm::reg_names::prefixes[(vinstr.imm.val / 8) % 8].c_str(),
+                          vm::reg_names::suffixes[(vinstr.imm.val / 8) / 8].c_str());
+            else
+              std::printf("> %s %p\n",
+                          vm::instrs::get_profile(vinstr.mnemonic)->name.c_str(),
+                          vinstr.imm.val);
           else
-            std::printf("> %s %p\n",
-                        vm::instrs::get_profile(vinstr.mnemonic)->name.c_str(),
-                        vinstr.imm.val);
-        else
-          std::printf("> %s\n",
-                      vm::instrs::get_profile(vinstr.mnemonic)->name.c_str());
+            std::printf("> %s\n",
+                        vm::instrs::get_profile(vinstr.mnemonic)->name.c_str());
+        }
       } else {
         zydis_rtn_t inst_stream;
         std::for_each(obj->cc_trace.m_instrs.begin(),
@@ -444,8 +460,6 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
             "> err: please define the following vm handler (at = %p):\n",
             (obj->cc_trace.m_begin - obj->m_vm->m_module_base) +
                 obj->m_vm->m_image_base);
-        std::printf("vsp: %s, vip: %s\n", ZydisRegisterGetString(obj->cc_trace.m_vsp),
-                                          ZydisRegisterGetString(obj->cc_trace.m_vip));
         vm::utils::print(inst_stream);
         uc_emu_stop(uc);
         return false;
@@ -471,7 +485,7 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
           // set current code block virtual jmp instruction information...
           obj->cc_blk->m_jmp.ctx = copy;
           obj->cc_blk->m_jmp.rip = obj->cc_trace.m_begin;
-          obj->cc_blk->m_jmp.stack = new std::uint8_t[STACK_SIZE];
+          obj->cc_blk->m_jmp.stack = new std::uint8_t[STACK_SIZE]; g_new_delete_tracker++;
           obj->cc_blk->m_jmp.m_vm = {obj->cc_trace.m_vip, obj->cc_trace.m_vsp};
           std::memcpy(obj->cc_blk->m_jmp.stack, obj->cc_trace.m_stack,
                       STACK_SIZE);
@@ -491,7 +505,7 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
                     uct_context_free(instr.m_cpu);
                   });
 
-    delete[] obj->cc_trace.m_stack;
+    delete[] obj->cc_trace.m_stack; if (obj->cc_trace.m_stack) g_new_delete_tracker--;
     obj->cc_trace.m_instrs.clear();
   }
   return true;
@@ -537,7 +551,7 @@ bool emu_t::legit_branch(vm::instrs::vblk_t& vblk, std::uintptr_t branch_addr) {
   uc_context* backup;
   uct_context_alloc(uc, &backup);
   uc_context_save(uc, backup);
-  std::uint8_t* stack = new std::uint8_t[STACK_SIZE];
+  std::uint8_t* stack = new std::uint8_t[STACK_SIZE]; g_new_delete_tracker++;
   uc_mem_read(uc, STACK_BASE, stack, STACK_SIZE);
 
   // restore cpu and stack back to the virtual jump handler...
@@ -557,7 +571,7 @@ bool emu_t::legit_branch(vm::instrs::vblk_t& vblk, std::uintptr_t branch_addr) {
   uc_mem_write(uc, STACK_BASE, stack, STACK_SIZE);
   uc_context_restore(uc, backup);
   uct_context_free(backup);
-  delete[] stack;
+  delete[] stack; if (stack) g_new_delete_tracker--;
 
   // add normal execution callback back...
   uc_hook_del(uc, branch_pred_hook);
