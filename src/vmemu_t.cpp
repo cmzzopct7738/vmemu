@@ -61,7 +61,9 @@ bool emu_t::init() {
 }
 
 bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
-  std::printf("\nSTARTING FROM NEW VMENTER AT %p (%p)\n\n", vmenter_rva + m_vm->m_module_base,
+  static int vmenter_number = 0;
+  std::printf("\n[%.4d]  STARTING FROM NEW VMENTER AT %p (%p)\n\n", vmenter_number++,
+                                                              vmenter_rva + m_vm->m_module_base,
                                                               vmenter_rva + m_vm->m_image_base);
   uc_err err;
   vrtn.m_rva = vmenter_rva;
