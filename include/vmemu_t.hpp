@@ -26,7 +26,7 @@ class emu_t {
   ~emu_t();
   bool init();
   bool emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn);
-  static const bool s_log_instructions = false;
+  const bool m_log_instructions = false;
 
  private:
   uc_engine* uc;

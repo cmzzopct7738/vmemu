@@ -2,6 +2,10 @@
 #include <vmemu_t.hpp>
 #include <unordered_set>
 
+#ifdef _WIN32
+#pragma warning(disable : 4477)
+#endif()
+
 int g_new_delete_tracker;
 namespace vm {
 emu_t::emu_t(vm::vmctx_t* vm_ctx) : m_vm(vm_ctx) {};
@@ -434,7 +438,7 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
     } else {
       const auto vinstr = vm::instrs::determine(obj->cc_trace);
       if (vinstr.mnemonic != vm::instrs::mnemonic_t::unknown) {
-        if (s_log_instructions) {
+        if (obj->m_log_instructions) {
           std::printf("%p: ", obj->cc_trace.m_begin + obj->m_vm->m_image_base - obj->m_vm->m_module_base);
           if (vinstr.imm.has_imm)
             if (vinstr.mnemonic == instrs::mnemonic_t::lreg || vinstr.mnemonic == instrs::mnemonic_t::sreg)
