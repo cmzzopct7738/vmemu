@@ -176,6 +176,7 @@ void emu_t::extract_branch_data() {
         br1 += m_vm->m_module_base;
         br2 += m_vm->m_module_base;
 
+        // We need to handle the case that the jump points to another jump
         auto br1_legit = legit_branch(*cc_blk, br1);
         auto br2_legit = legit_branch(*cc_blk, br2);
         std::printf("> br1 legit: %d, br2 legit: %d\n", br1_legit, br2_legit);
@@ -273,18 +274,9 @@ bool emu_t::branch_pred_spec_exec(uc_engine* uc, uint64_t address,
   }
 
   if (instr.mnemonic == ZYDIS_MNEMONIC_INVALID) return false;
-
   uc_context* ctx;
   uct_context_alloc(uc, &ctx);
   uc_context_save(uc, ctx);
-
-  // if this is the first instruction of this handler then save the stack...
-  if (!obj->cc_trace.m_instrs.size()) {
-    obj->cc_trace.m_vip = obj->cc_blk->m_vm.vip;
-    obj->cc_trace.m_vsp = obj->cc_blk->m_vm.vsp;
-    obj->cc_trace.m_stack = new std::uint8_t[STACK_SIZE]; g_new_delete_tracker++;
-    uc_mem_read(uc, STACK_BASE, obj->cc_trace.m_stack, STACK_SIZE);
-  }
 
   obj->cc_trace.m_instrs.push_back({instr, ctx});
 
@@ -296,7 +288,7 @@ bool emu_t::branch_pred_spec_exec(uc_engine* uc, uint64_t address,
     // makes it easier for profiles to be correct...
     vm::instrs::deobfuscate(obj->cc_trace);
 
-    // find the last MOV REG, DWORD PTR [VIP] in the instruction stream, then
+/*     // find the last MOV REG, DWORD PTR [VIP] in the instruction stream, then
     // remove any instructions from this instruction to the JMP/RET...
     const auto rva_fetch = std::find_if(
         obj->cc_trace.m_instrs.rbegin(), obj->cc_trace.m_instrs.rend(),
@@ -307,7 +299,7 @@ bool emu_t::branch_pred_spec_exec(uc_engine* uc, uint64_t address,
                  i.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
                  i.operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
                  i.operands[1].mem.base == vip && i.operands[1].size == 32;
-        });
+        }); 
 
     if (rva_fetch != obj->cc_trace.m_instrs.rend())
     {
@@ -317,17 +309,16 @@ bool emu_t::branch_pred_spec_exec(uc_engine* uc, uint64_t address,
       }
       obj->cc_trace.m_instrs.erase((rva_fetch + 1).base(),
                                    obj->cc_trace.m_instrs.end());
-    }
+    } */
 
     const auto vinstr = vm::instrs::determine(obj->cc_trace);
-
+    
     // -- free the trace since we will start a new one...
     std::for_each(obj->cc_trace.m_instrs.begin(), obj->cc_trace.m_instrs.end(),
                   [&](const vm::instrs::emu_instr_t& instr) {
                     uct_context_free(instr.m_cpu);
                   });
 
-    delete[] obj->cc_trace.m_stack; if (obj->cc_trace.m_stack) g_new_delete_tracker--;
     obj->cc_trace.m_instrs.clear();
 
     if (vinstr.mnemonic != vm::instrs::mnemonic_t::jmp) {
@@ -569,6 +560,10 @@ bool emu_t::legit_branch(vm::instrs::vblk_t& vblk, std::uintptr_t branch_addr) {
   uc_reg_read(uc, UC_X86_REG_RIP, &rip);
   uc_reg_read(uc, vm::instrs::reg_map[vblk.m_vm.vsp], &vsp);
   uc_mem_write(uc, vsp, &branch_addr, sizeof branch_addr);
+  
+  // reset vsp and vip to their pre-jmp status in the current code trace
+  // this will be reset when the jmp instruction is emulated again
+  cc_trace.m_vsp = cc_blk->m_vm.vsp, cc_trace.m_vip = cc_blk->m_vm.vip;
 
   m_sreg_cnt = 0u;
   uc_emu_start(uc, rip, 0ull, 0ull, 0ull);
@@ -610,31 +605,37 @@ std::optional<std::pair<std::uintptr_t, std::uintptr_t>> emu_t::could_have_jcc(
     return v.mnemonic == vm::instrs::mnemonic_t::lconst && v.imm.size == 64;
   };
 
-  const auto lconst1 =
-      std::find_if(vinstrs.rbegin(), vinstrs.rend(), lconst64_chk);
+  static const auto valid_mem = [=](uintptr_t loc)
+  {
+      // check to see if the imm val is inside of the image...
+    if (loc > m_vm->m_image_base + m_vm->m_image_size ||
+        loc < m_vm->m_image_base ||
+        loc > m_vm->m_image_base + m_vm->m_image_size ||
+        loc < m_vm->m_image_base)
+      return false;
 
-  if (lconst1 == vinstrs.rend()) return {};
+    // check to see if the imm's points to something inside of an executable
+    // section...
+    if (!vm::utils::scn::executable(
+            m_vm->m_module_base,
+            (loc - m_vm->m_image_base) + m_vm->m_module_base))
+      return false;
+    return true; 
+  };
 
-  const auto lconst2 = std::find_if(lconst1 + 1, vinstrs.rend(), lconst64_chk);
+  auto lconst1 = vinstrs.rbegin();
+  do {
+    lconst1 =
+      std::find_if(lconst1 + 1, vinstrs.rend(), lconst64_chk);
+    if (lconst1 == vinstrs.rend()) return {};
+  } while (!valid_mem(lconst1->imm.val));
 
+  auto lconst2 = lconst1;
+  do {
+    lconst2 =
+      std::find_if(lconst2 + 1, vinstrs.rend(), lconst64_chk);
   if (lconst2 == vinstrs.rend()) return {};
-
-  // check to see if the imm val is inside of the image...
-  if (lconst1->imm.val > m_vm->m_image_base + m_vm->m_image_size ||
-      lconst1->imm.val < m_vm->m_image_base ||
-      lconst2->imm.val > m_vm->m_image_base + m_vm->m_image_size ||
-      lconst2->imm.val < m_vm->m_image_base)
-    return {};
-
-  // check to see if the imm's points to something inside of an executable
-  // section...
-  if (!vm::utils::scn::executable(
-          m_vm->m_module_base,
-          (lconst1->imm.val - m_vm->m_image_base) + m_vm->m_module_base) ||
-      !vm::utils::scn::executable(
-          m_vm->m_module_base,
-          (lconst2->imm.val - m_vm->m_image_base) + m_vm->m_module_base))
-    return {};
+  } while (!valid_mem(lconst1->imm.val));
 
   return {{lconst1->imm.val, lconst2->imm.val}};
 }
