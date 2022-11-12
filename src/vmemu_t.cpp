@@ -65,10 +65,6 @@ bool emu_t::init() {
 }
 
 bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
-  static int vmenter_number = 0;
-  std::printf("\n[%.4d]  STARTING FROM NEW VMENTER AT %p (%p)\n\n", vmenter_number++,
-                                                              vmenter_rva + m_vm->m_module_base,
-                                                              vmenter_rva + m_vm->m_image_base);
   uc_err err;
   vrtn.m_rva = vmenter_rva;
 
@@ -128,6 +124,7 @@ bool emu_t::emulate(std::uint32_t vmenter_rva, vm::instrs::vrtn_t& vrtn) {
         auto& new_blk = vrtn.m_blks.emplace_back();
         new_blk.m_vip = {0ull, 0ull};
         new_blk.m_vm = {blk.m_jmp.m_vm.vip, blk.m_jmp.m_vm.vsp};
+        new_blk.is_branch = true;
         cc_blk = &new_blk;
 
         // emulate the branch...
@@ -176,7 +173,6 @@ void emu_t::extract_branch_data() {
         br1 += m_vm->m_module_base;
         br2 += m_vm->m_module_base;
 
-        // We need to handle the case that the jump points to another jump
         auto br1_legit = legit_branch(*cc_blk, br1);
         auto br2_legit = legit_branch(*cc_blk, br2);
         std::printf("> br1 legit: %d, br2 legit: %d\n", br1_legit, br2_legit);
@@ -416,7 +412,7 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
       uc_context* backup;
       uct_context_alloc(uc, &backup);
       uc_context_save(uc, backup);
-      uc_context_restore(uc, (--vip_write)->m_cpu);
+        uc_context_restore(uc, vip_write->m_cpu);
       
       std::uintptr_t vip_addr = 0ull;
       uc_reg_read(uc, vm::instrs::reg_map[obj->cc_trace.m_vip], &vip_addr);
@@ -461,8 +457,8 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
         uc_emu_stop(uc);
         return false;
       }
-
-      if (obj->cc_blk->m_vinstrs.size()) {
+      //I don't think this if statement is neccesary
+      //if (obj->cc_blk->m_vinstrs.size()) {
         if (vinstr.mnemonic == vm::instrs::mnemonic_t::jmp) {
           uc_context *backup, *copy;
 
@@ -491,8 +487,7 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
         if (vinstr.mnemonic == vm::instrs::mnemonic_t::jmp ||
             vinstr.mnemonic == vm::instrs::mnemonic_t::vmexit)
           uc_emu_stop(obj->uc);
-      }
-
+      //}
       obj->cc_blk->m_vinstrs.push_back(vinstr);
     }
 
@@ -506,7 +501,7 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
     obj->cc_trace.m_instrs.clear();
   }
   return true;
-}
+ }
 
 void emu_t::invalid_mem(uc_engine* uc, uc_mem_type type, uint64_t address,
                         int size, int64_t value, emu_t* obj) {
