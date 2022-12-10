@@ -269,11 +269,13 @@ bool emu_t::branch_pred_spec_exec(uc_engine* uc, uint64_t address,
     return false;
   }
 
-  if (instr.mnemonic == ZYDIS_MNEMONIC_INVALID) return false;
+  if (instr.mnemonic == ZYDIS_MNEMONIC_INVALID) {std::printf("> bad instruction\n"); return false;}
   uc_context* ctx;
   uct_context_alloc(uc, &ctx);
   uc_context_save(uc, ctx);
 
+  if (obj->cc_trace.m_instrs.empty())
+    obj->cc_trace.m_begin = address;
   obj->cc_trace.m_instrs.push_back({instr, ctx});
 
   // RET or JMP REG means the end of a vm handler...
@@ -283,7 +285,15 @@ bool emu_t::branch_pred_spec_exec(uc_engine* uc, uint64_t address,
     // deobfuscate the instruction stream before profiling...
     // makes it easier for profiles to be correct...
     vm::instrs::deobfuscate(obj->cc_trace);
-
+    std::printf("> vsp = %s, vip = %s, address = %p (%p)\n", ZydisRegisterGetString(obj->cc_trace.m_vsp), ZydisRegisterGetString(obj->cc_trace.m_vip),
+      obj->cc_trace.m_begin, obj->cc_trace.m_begin - obj->m_vm->m_module_base + obj->m_vm->m_image_base);
+    zydis_rtn_t inst_stream;
+    std::for_each(obj->cc_trace.m_instrs.begin(),
+                  obj->cc_trace.m_instrs.end(),
+                  [&](vm::instrs::emu_instr_t& instr) {
+                    inst_stream.push_back({instr.m_instr});
+                  });
+    vm::utils::print(inst_stream);
 /*     // find the last MOV REG, DWORD PTR [VIP] in the instruction stream, then
     // remove any instructions from this instruction to the JMP/RET...
     const auto rva_fetch = std::find_if(
@@ -308,7 +318,7 @@ bool emu_t::branch_pred_spec_exec(uc_engine* uc, uint64_t address,
     } */
 
     const auto vinstr = vm::instrs::determine(obj->cc_trace);
-    
+    std::printf("instruction is: %d\n", vinstr.mnemonic);
     // -- free the trace since we will start a new one...
     std::for_each(obj->cc_trace.m_instrs.begin(), obj->cc_trace.m_instrs.end(),
                   [&](const vm::instrs::emu_instr_t& instr) {
@@ -318,13 +328,16 @@ bool emu_t::branch_pred_spec_exec(uc_engine* uc, uint64_t address,
     obj->cc_trace.m_instrs.clear();
 
     if (vinstr.mnemonic != vm::instrs::mnemonic_t::jmp) {
-      if (vinstr.mnemonic != vm::instrs::mnemonic_t::sreg) uc_emu_stop(uc);
+/*       if (vinstr.mnemonic != vm::instrs::mnemonic_t::sreg) uc_emu_stop(uc);
 
       if (!vinstr.imm.has_imm) uc_emu_stop(uc);
 
       if (vinstr.imm.size != 8 || vinstr.imm.val > 8 * VIRTUAL_REGISTER_COUNT)
-        uc_emu_stop(uc);
+        uc_emu_stop(uc); */
 
+      // stop if done or if instruction is invalid
+      if (vinstr.mnemonic == instrs::mnemonic_t::unknown)
+        uc_emu_stop(uc);
       // -- stop after 10 legit SREG's...
       if (++obj->m_sreg_cnt == 10) uc_emu_stop(uc);
     }
@@ -608,14 +621,7 @@ std::optional<std::pair<std::uintptr_t, std::uintptr_t>> emu_t::could_have_jcc(
         loc > m_vm->m_image_base + m_vm->m_image_size ||
         loc < m_vm->m_image_base)
       return false;
-
-    // check to see if the imm's points to something inside of an executable
-    // section...
-    if (!vm::utils::scn::executable(
-            m_vm->m_module_base,
-            (loc - m_vm->m_image_base) + m_vm->m_module_base))
-      return false;
-    return true; 
+    return true;
   };
 
   auto lconst1 = vinstrs.rbegin();
@@ -631,6 +637,8 @@ std::optional<std::pair<std::uintptr_t, std::uintptr_t>> emu_t::could_have_jcc(
       std::find_if(lconst2 + 1, vinstrs.rend(), lconst64_chk);
   if (lconst2 == vinstrs.rend()) return {};
   } while (!valid_mem(lconst1->imm.val));
+
+  std::printf("possible jcc: %p, %p\n", lconst1->imm.val, lconst2->imm.val);
 
   return {{lconst1->imm.val, lconst2->imm.val}};
 }
