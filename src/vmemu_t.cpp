@@ -285,15 +285,7 @@ bool emu_t::branch_pred_spec_exec(uc_engine* uc, uint64_t address,
     // deobfuscate the instruction stream before profiling...
     // makes it easier for profiles to be correct...
     vm::instrs::deobfuscate(obj->cc_trace);
-    std::printf("> vsp = %s, vip = %s, address = %p (%p)\n", ZydisRegisterGetString(obj->cc_trace.m_vsp), ZydisRegisterGetString(obj->cc_trace.m_vip),
-      obj->cc_trace.m_begin, obj->cc_trace.m_begin - obj->m_vm->m_module_base + obj->m_vm->m_image_base);
-    zydis_rtn_t inst_stream;
-    std::for_each(obj->cc_trace.m_instrs.begin(),
-                  obj->cc_trace.m_instrs.end(),
-                  [&](vm::instrs::emu_instr_t& instr) {
-                    inst_stream.push_back({instr.m_instr});
-                  });
-    vm::utils::print(inst_stream);
+
 /*     // find the last MOV REG, DWORD PTR [VIP] in the instruction stream, then
     // remove any instructions from this instruction to the JMP/RET...
     const auto rva_fetch = std::find_if(
@@ -318,7 +310,7 @@ bool emu_t::branch_pred_spec_exec(uc_engine* uc, uint64_t address,
     } */
 
     const auto vinstr = vm::instrs::determine(obj->cc_trace);
-    std::printf("instruction is: %d\n", vinstr.mnemonic);
+
     // -- free the trace since we will start a new one...
     std::for_each(obj->cc_trace.m_instrs.begin(), obj->cc_trace.m_instrs.end(),
                   [&](const vm::instrs::emu_instr_t& instr) {
@@ -328,12 +320,12 @@ bool emu_t::branch_pred_spec_exec(uc_engine* uc, uint64_t address,
     obj->cc_trace.m_instrs.clear();
 
     if (vinstr.mnemonic != vm::instrs::mnemonic_t::jmp) {
-/*       if (vinstr.mnemonic != vm::instrs::mnemonic_t::sreg) uc_emu_stop(uc);
+      if (vinstr.mnemonic != vm::instrs::mnemonic_t::sreg) uc_emu_stop(uc);
 
       if (!vinstr.imm.has_imm) uc_emu_stop(uc);
 
       if (vinstr.imm.size != 8 || vinstr.imm.val > 8 * VIRTUAL_REGISTER_COUNT)
-        uc_emu_stop(uc); */
+        uc_emu_stop(uc);
 
       // stop if done or if instruction is invalid
       if (vinstr.mnemonic == instrs::mnemonic_t::unknown)
@@ -496,7 +488,36 @@ bool emu_t::code_exec_callback(uc_engine* uc, uint64_t address, uint32_t size,
           std::memcpy(obj->cc_blk->m_jmp.stack, obj->cc_trace.m_stack,
                       STACK_SIZE);
         }
-
+        if (vinstr.mnemonic == vm::instrs::mnemonic_t::vmexit)
+        {
+          int i = 0;
+          for (const auto& instr_it : obj->cc_trace.m_instrs)
+          {
+            if ((instr_it.m_instr.mnemonic == ZYDIS_MNEMONIC_POP || 
+                instr_it.m_instr.mnemonic == ZYDIS_MNEMONIC_POPFQ) && 
+                instr_it.m_instr.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
+            {
+              if (i >= 16)
+              {
+                std::printf("[!] failed to parse vmexit pops\n");
+                return false;
+              }
+              auto pushed_reg = instr_it.m_instr.operands[instr_it.m_instr.mnemonic == ZYDIS_MNEMONIC_POPFQ ? 2 : 0].reg.value;
+              if (std::find(obj->cc_blk->vmexit_pop_order.begin(), obj->cc_blk->vmexit_pop_order.begin() + i, pushed_reg)
+                != obj->cc_blk->vmexit_pop_order.begin() + i)
+              {
+                std::printf("[!] failed to parse vmexit pops\n");
+                return false;
+              }
+              obj->cc_blk->vmexit_pop_order[i++] = pushed_reg;
+            }
+          }
+          if (i != 16) 
+          {
+            std::printf("[!] failed to parse vmexit pops\n");
+            return false;
+          }
+        }
         if (vinstr.mnemonic == vm::instrs::mnemonic_t::jmp ||
             vinstr.mnemonic == vm::instrs::mnemonic_t::vmexit)
           uc_emu_stop(obj->uc);
